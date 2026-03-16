@@ -4,4 +4,6 @@ src/*.o
 __pycache__/
 *.pyc
 
+release/
+
 .DS_Store
