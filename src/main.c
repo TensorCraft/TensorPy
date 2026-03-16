@@ -1,0 +1,145 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "tensorpy/common.h"
+#include "tensorpy/chunk.h"
+#include "tensorpy/debug.h"
+#include "tensorpy/vm.h"
+
+static bool startsWithKeyword(const char* line, const char* keyword) {
+    size_t len = strlen(keyword);
+    return strncmp(line, keyword, len) == 0 &&
+           (line[len] == '\0' || line[len] == ' ' || line[len] == '\t' ||
+            line[len] == '\n' || line[len] == '(' || line[len] == ':');
+}
+
+static bool hasAssignment(const char* line) {
+    for (size_t i = 0; line[i] != '\0'; i++) {
+        if (line[i] != '=') continue;
+        if (line[i + 1] == '=') {
+            i++;
+            continue;
+        }
+        if (i > 0) {
+            char prev = line[i - 1];
+            if (prev == '!' || prev == '<' || prev == '>' || prev == '=') {
+                continue;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool isLikelyExpression(const char* line) {
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '\0' || *line == '\n') return false;
+
+    if (startsWithKeyword(line, "if") ||
+        startsWithKeyword(line, "for") ||
+        startsWithKeyword(line, "while") ||
+        startsWithKeyword(line, "def") ||
+        startsWithKeyword(line, "class") ||
+        startsWithKeyword(line, "return") ||
+        startsWithKeyword(line, "break") ||
+        startsWithKeyword(line, "continue") ||
+        startsWithKeyword(line, "pass") ||
+        startsWithKeyword(line, "try") ||
+        startsWithKeyword(line, "except") ||
+        startsWithKeyword(line, "else") ||
+        startsWithKeyword(line, "elif") ||
+        startsWithKeyword(line, "raise") ||
+        startsWithKeyword(line, "del") ||
+        startsWithKeyword(line, "print")) {
+        return false;
+    }
+
+    if (hasAssignment(line)) return false;
+
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == ' ' || line[len - 1] == '\t')) {
+        len--;
+    }
+    if (len > 0 && line[len - 1] == ':') return false;
+
+    return true;
+}
+
+static void repl() {
+    char line[1024];
+    char wrapped[1152];
+    for (;;) {
+        printf("> ");
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            printf("\n");
+            break;
+        }
+
+        if (isLikelyExpression(line)) {
+            snprintf(wrapped, sizeof(wrapped), "print(%s)", line);
+            interpret(wrapped, "stdin");
+        } else {
+            interpret(line, "stdin");
+        }
+    }
+}
+
+static char* readFile(const char* path) {
+    FILE* file = fopen(path, "rb");
+    if (file == NULL) {
+        fprintf(stderr, "Could not open file \"%s\".\n", path);
+        exit(74);
+    }
+
+    fseek(file, 0L, SEEK_END);
+    size_t fileSize = ftell(file);
+    rewind(file);
+
+    char* buffer = (char*)malloc(fileSize + 1);
+    if (buffer == NULL) {
+        fprintf(stderr, "Not enough memory to read \"%s\".\n", path);
+        exit(74);
+    }
+
+    size_t bytesRead = fread(buffer, sizeof(char), fileSize, file);
+    if (bytesRead < fileSize) {
+        fprintf(stderr, "Could not read file \"%s\".\n", path);
+        exit(74);
+    }
+
+    buffer[bytesRead] = '\0';
+
+    fclose(file);
+    return buffer;
+}
+
+static void runFile(const char* path) {
+    char* source = readFile(path);
+    InterpretResult result = interpret(source, path);
+    free(source);
+
+    if (result == INTERPRET_COMPILE_ERROR) exit(65);
+    if (result == INTERPRET_RUNTIME_ERROR) exit(70);
+}
+
+int main(int argc, const char* argv[]) {
+    initVM();
+
+    if (argc == 1) {
+        repl();
+    } else if (argc == 2) {
+        runFile(argv[1]);
+    } else if (argc == 3 && strcmp(argv[1], "-c") == 0) {
+        interpret(argv[2], "command line");
+    } else {
+        fprintf(stderr, "Usage: tensorpy [path]\n");
+        fprintf(stderr, "       tensorpy -c \"code\"\n");
+        exit(64);
+    }
+
+    freeVM();
+    return 0;
+}

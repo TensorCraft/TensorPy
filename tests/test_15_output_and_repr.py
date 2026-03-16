@@ -1,0 +1,7 @@
+print("plain")
+print(["a", "b"])
+print({"x": "y"})
+print(("a", ["b"], {"c": "d"}))
+print({"nested": ["v1", {"k": "v2"}]})
+print(["a", ["b", "c"], {"d": ["e"]}])
+print(["quote\"", "slash\\", "line\nbreak"])
