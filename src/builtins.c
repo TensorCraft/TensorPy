@@ -21,6 +21,7 @@ static bool valueMatchesTypeName(Value value, ObjString* name) {
     switch (OBJ_TYPE(value)) {
         case OBJ_STRING: return strcmp(typeName, "str") == 0;
         case OBJ_NATIVE: return strcmp(typeName, "builtin_function_or_method") == 0;
+        case OBJ_CLOSURE: return strcmp(typeName, "function") == 0;
         case OBJ_SET: return strcmp(typeName, "set") == 0;
         case OBJ_LIST: return strcmp(typeName, "list") == 0;
         case OBJ_DICT: return strcmp(typeName, "dict") == 0;
@@ -51,8 +52,8 @@ static bool getAttributeValue(Value object, ObjString* name, Value* result) {
 
         Value method;
         if (tableGet(&instance->klass->methods, OBJ_VAL(name), &method)) {
-            if (IS_FUNCTION(method)) {
-                *result = OBJ_VAL(newBoundMethod(object, AS_FUNCTION(method)));
+            if (IS_FUNCTION(method) || IS_CLOSURE(method)) {
+                *result = OBJ_VAL(newBoundMethod(object, method));
             } else {
                 *result = method;
             }
@@ -251,6 +252,7 @@ static Value typeNative(int argCount, Value* args) {
             switch (OBJ_TYPE(args[0])) {
                 case OBJ_STRING:   return OBJ_VAL(copyString("str", 3));
                 case OBJ_NATIVE:   return OBJ_VAL(copyString("builtin_function_or_method", 26));
+                case OBJ_CLOSURE:  return OBJ_VAL(copyString("function", 8));
                 case OBJ_SET:      return OBJ_VAL(copyString("set", 3));
                 case OBJ_LIST:     return OBJ_VAL(copyString("list", 4));
                 case OBJ_DICT:     return OBJ_VAL(copyString("dict", 4));
@@ -356,7 +358,7 @@ static Value chrNative(int argCount, Value* args) {
 static Value dirNative(int argCount, Value* args) {
     ObjList* out = newList();
     if (argCount == 0) {
-        appendDirEntries(out, &vm.globals);
+        appendDirEntries(out, vm.globalEnv->table);
         return OBJ_VAL(out);
     }
 
@@ -403,6 +405,29 @@ static Value platformNameNative(int argCount, Value* args) {
     (void)args;
     const char* name = platformName();
     return OBJ_VAL(copyString(name, (int)strlen(name)));
+}
+
+static Value gcMarkCountNative(int argCount, Value* args) {
+    (void)args;
+    if (argCount != 0) return NIL_VAL;
+    return NUMBER_VAL((double)gcMarkRootsAndCount());
+}
+
+static Value gcReachableCountNative(int argCount, Value* args) {
+    if (argCount != 1) return NIL_VAL;
+    return NUMBER_VAL((double)gcCountReachableFromValue(args[0]));
+}
+
+static Value gcCollectNative(int argCount, Value* args) {
+    (void)args;
+    if (argCount != 0) return NIL_VAL;
+    return NUMBER_VAL((double)gcCollect());
+}
+
+static Value gcObjectCountNative(int argCount, Value* args) {
+    (void)args;
+    if (argCount != 0) return NIL_VAL;
+    return NUMBER_VAL((double)gcObjectCount());
 }
 
 static Value mathUnaryNative(int argCount, Value* args, double (*fn)(double)) {
@@ -503,7 +528,7 @@ static Value rangeNative(int argCount, Value* args) {
 static void defineNative(const char* name, NativeFn function) {
     Value key = OBJ_VAL(copyString(name, (int)strlen(name)));
     Value native = OBJ_VAL(newNative(function));
-    tableSet(&vm.globals, key, native);
+    tableSet(vm.globalEnv->table, key, native);
 }
 
 void registerBuiltins() {
@@ -537,6 +562,10 @@ void registerBuiltins() {
     defineNative("__platform_random", platformRandomNative);
     defineNative("__platform_getcwd", platformGetcwdNative);
     defineNative("__platform_name", platformNameNative);
+    defineNative("__gc_mark_count", gcMarkCountNative);
+    defineNative("__gc_reachable_count", gcReachableCountNative);
+    defineNative("__gc_collect", gcCollectNative);
+    defineNative("__gc_object_count", gcObjectCountNative);
     defineNative("__math_sqrt", mathSqrtNative);
     defineNative("__math_sin", mathSinNative);
     defineNative("__math_cos", mathCosNative);

@@ -12,10 +12,16 @@
     (type*)allocateObject(sizeof(type), objectType)
 
 static Obj* allocateObject(size_t size, ObjType type) {
+    if (vm.gcEnabled && vm.gcPauseDepth == 0 && vm.objectCount >= vm.nextGC) {
+        gcCollect();
+    }
+
     Obj* object = (Obj*)malloc(size);
     object->type = type;
-    object->next = vm.objects; 
+    object->isMarked = false;
+    object->next = vm.objects;
     vm.objects = object;
+    vm.objectCount++;
     return object;
 }
 
@@ -34,6 +40,59 @@ static ObjString* allocateString(char* chars, int length, uint32_t hash) {
     string->chars = chars;
     string->hash = hash;
     return string;
+}
+
+static void freeObject(Obj* object) {
+    switch (object->type) {
+        case OBJ_STRING:
+            free(((ObjString*)object)->chars);
+            break;
+        case OBJ_FUNCTION: {
+            ObjFunction* function = (ObjFunction*)object;
+            freeValueArray(&function->defaults);
+            freeValueArray(&function->paramNames);
+            freeValueArray(&function->localNames);
+            freeChunk(&function->chunk);
+            break;
+        }
+        case OBJ_CLOSURE:
+        case OBJ_NATIVE:
+        case OBJ_SLICE:
+        case OBJ_ITERATOR:
+        case OBJ_BOUND_METHOD:
+            break;
+        case OBJ_ENVIRONMENT: {
+            ObjEnvironment* env = (ObjEnvironment*)object;
+            if (env->ownsTable) {
+                freeTable(env->table);
+            }
+            break;
+        }
+        case OBJ_SET:
+            freeTable(&((ObjSet*)object)->table);
+            break;
+        case OBJ_LIST:
+            freeValueArray(&((ObjList*)object)->items);
+            break;
+        case OBJ_DICT:
+            freeTable(&((ObjDict*)object)->table);
+            break;
+        case OBJ_TUPLE:
+            freeValueArray(&((ObjTuple*)object)->items);
+            break;
+        case OBJ_BYTES:
+            free(((ObjBytes*)object)->bytes);
+            break;
+        case OBJ_CLASS:
+            freeTable(&((ObjClass*)object)->methods);
+            break;
+        case OBJ_INSTANCE:
+            freeTable(&((ObjInstance*)object)->fields);
+            break;
+    }
+
+    vm.objectCount--;
+    free(object);
 }
 
 ObjString* copyString(const char* chars, int length) {
@@ -92,7 +151,7 @@ ObjFunction* newFunction() {
     function->arity = 0;
     function->defaultsCount = 0;
     function->maxSlots = 0;
-    function->globals = NULL;
+    function->hasVarargs = false;
     initValueArray(&function->defaults);
     initValueArray(&function->paramNames);
     initValueArray(&function->localNames);
@@ -101,11 +160,29 @@ ObjFunction* newFunction() {
     return function;
 }
 
-ObjFunction* cloneFunction(ObjFunction* function) {
-    ObjFunction* clone = ALLOCATE_OBJ(ObjFunction, OBJ_FUNCTION);
-    *clone = *function;
-    clone->globals = NULL;
-    return clone;
+ObjClosure* newClosure(ObjFunction* function, ObjEnvironment* env) {
+    ObjClosure* closure = ALLOCATE_OBJ(ObjClosure, OBJ_CLOSURE);
+    closure->function = function;
+    closure->env = env;
+    return closure;
+}
+
+ObjEnvironment* newEnvironment(ObjEnvironment* parent) {
+    ObjEnvironment* env = ALLOCATE_OBJ(ObjEnvironment, OBJ_ENVIRONMENT);
+    initTable(&env->values);
+    env->table = &env->values;
+    env->ownsTable = true;
+    env->parent = parent;
+    return env;
+}
+
+ObjEnvironment* newEnvironmentWithTable(ObjEnvironment* parent, Table* table) {
+    ObjEnvironment* env = ALLOCATE_OBJ(ObjEnvironment, OBJ_ENVIRONMENT);
+    initTable(&env->values);
+    env->table = table;
+    env->ownsTable = false;
+    env->parent = parent;
+    return env;
 }
 
 ObjNative* newNative(NativeFn function) {
@@ -153,11 +230,52 @@ ObjInstance* newInstance(ObjClass* klass) {
     return instance;
 }
 
-ObjBoundMethod* newBoundMethod(Value receiver, ObjFunction* method) {
+ObjBoundMethod* newBoundMethod(Value receiver, Value method) {
     ObjBoundMethod* bound = ALLOCATE_OBJ(ObjBoundMethod, OBJ_BOUND_METHOD);
     bound->receiver = receiver;
     bound->method = method;
     return bound;
+}
+
+void freeObjects(void) {
+    Obj* object = vm.objects;
+    while (object != NULL) {
+        Obj* next = object->next;
+        freeObject(object);
+        object = next;
+    }
+    vm.objects = NULL;
+}
+
+int sweepUnmarkedObjects(void) {
+    int freed = 0;
+    Obj* previous = NULL;
+    Obj* object = vm.objects;
+
+    while (object != NULL) {
+        if (object->isMarked) {
+            object->isMarked = false;
+            previous = object;
+            object = object->next;
+            continue;
+        }
+
+        Obj* unreached = object;
+        object = object->next;
+        if (previous != NULL) {
+            previous->next = object;
+        } else {
+            vm.objects = object;
+        }
+        freeObject(unreached);
+        freed++;
+    }
+
+    return freed;
+}
+
+int countObjects(void) {
+    return (int)vm.objectCount;
 }
 
 void printObject(Value value) {
@@ -174,6 +292,16 @@ void printObject(Value value) {
             } else {
                 printf("<fn %s>", AS_FUNCTION(value)->name->chars);
             }
+            break;
+        case OBJ_CLOSURE:
+            if (AS_CLOSURE(value)->function->name == NULL) {
+                printf("<script>");
+            } else {
+                printf("<fn %s>", AS_CLOSURE(value)->function->name->chars);
+            }
+            break;
+        case OBJ_ENVIRONMENT:
+            printf("<env>");
             break;
         case OBJ_SET: {
             printf("{");
@@ -242,10 +370,22 @@ void printObject(Value value) {
             printf("<%s instance>", AS_INSTANCE(value)->klass->name->chars);
             break;
         case OBJ_BOUND_METHOD:
-            if (AS_BOUND_METHOD(value)->method->name == NULL) {
-                printf("<bound method>");
+            if (IS_CLOSURE(AS_BOUND_METHOD(value)->method)) {
+                ObjFunction* method = AS_CLOSURE(AS_BOUND_METHOD(value)->method)->function;
+                if (method->name == NULL) {
+                    printf("<bound method>");
+                } else {
+                    printf("<bound method %s>", method->name->chars);
+                }
+            } else if (IS_FUNCTION(AS_BOUND_METHOD(value)->method)) {
+                ObjFunction* method = AS_FUNCTION(AS_BOUND_METHOD(value)->method);
+                if (method->name == NULL) {
+                    printf("<bound method>");
+                } else {
+                    printf("<bound method %s>", method->name->chars);
+                }
             } else {
-                printf("<bound method %s>", AS_BOUND_METHOD(value)->method->name->chars);
+                printf("<bound method>");
             }
             break;
         case OBJ_SLICE: {

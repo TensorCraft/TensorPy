@@ -9,7 +9,7 @@ This project is still in an active build-out phase. The goal right now is practi
 - Python-like syntax for expressions, functions, classes, conditionals, loops, slicing, and container literals
 - Core data structures: `list`, `tuple`, `dict`, `set`, `str`, `bytes`
 - Typed exceptions with `try` / `except`, including `except Exception as e`
-- Improved function call semantics for keyword arguments, duplicate parameter checks, and missing-argument reporting
+- Improved function call semantics for keyword arguments, duplicate parameter checks, missing-argument reporting, and `*args`
 - Basic nested-function closure capture for outer bindings
 - REPL plus file execution
 - Basic module imports:
@@ -51,6 +51,14 @@ This project is still in an active build-out phase. The goal right now is practi
   - nested functions now capture outer bindings
   - `json` validation and `re` alternation support received a second pass
   - REPL multi-line block input was improved
+- `Phase 4`: completed
+  - focus: GC readiness and memory model stabilization
+  - object environment and closure ownership have been normalized ahead of GC
+  - a non-collecting mark walker now traverses VM roots and heap object edges
+  - object finalization and VM teardown now free heap-owned buffers and objects
+  - an explicit mark-and-sweep collector now reclaims unreachable heap objects
+  - a conservative automatic GC trigger now runs from object allocation thresholds
+  - next step: return to language and compatibility work on top of the stabilized runtime
 
 ## Implemented Library Surface
 
@@ -79,6 +87,8 @@ Common builtins now also include:
 - `ord`
 - `chr`
 - `dir`
+
+Functions, lambdas, and methods now support `*args` collection.
 
 The `json` module supports:
 

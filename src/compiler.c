@@ -407,15 +407,27 @@ static void lambdaExpression(bool canAssign) {
     int defaultsCount = 0;
     Token paramNames[255];
     int paramCount = 0;
+    bool sawVarargs = false;
     
     if (!check(TOKEN_COLON)) {
         do {
+            bool isVarargs = match(TOKEN_STAR);
             consume(TOKEN_IDENTIFIER, "Expect parameter name.");
             if (hasDuplicateParam(paramNames, paramCount, &parser.previous)) {
                 error("Duplicate parameter name.");
             }
             paramNames[paramCount++] = parser.previous;
-            if (match(TOKEN_EQUAL)) {
+            if (isVarargs) {
+                if (sawVarargs) {
+                    error("Can't have more than one varargs parameter.");
+                }
+                if (match(TOKEN_EQUAL)) {
+                    error("Varargs parameter cannot have a default value.");
+                }
+                sawVarargs = true;
+            } else if (sawVarargs) {
+                error("Parameters cannot follow varargs parameter.");
+            } else if (match(TOKEN_EQUAL)) {
                 expression(); // Evaluated in outer scope
                 defaultsCount++;
             } else if (defaultsCount > 0) {
@@ -439,11 +451,19 @@ static void lambdaExpression(bool canAssign) {
 
     if (!check(TOKEN_COLON)) {
         do {
-            current->function->arity++;
+            bool isVarargs = match(TOKEN_STAR);
             consume(TOKEN_IDENTIFIER, "Expect parameter name.");
+            if (!isVarargs) {
+                current->function->arity++;
+            } else {
+                current->function->hasVarargs = true;
+            }
             addLocal(parser.previous);
             current->locals[current->localCount - 1].depth = current->scopeDepth;
             if (match(TOKEN_EQUAL)) {
+                if (isVarargs) {
+                    error("Varargs parameter cannot have a default value.");
+                }
                 // Skip expression
                 int bracketLevel = 0;
                 while (bracketLevel > 0 || (!check(TOKEN_COMMA) && !check(TOKEN_COLON))) {
@@ -1130,16 +1150,28 @@ static void function(FunctionType type) {
   int defaultsCount = 0;
   Token paramNames[255];
   int paramCount = 0;
+  bool sawVarargs = false;
 
   consume(TOKEN_LEFT_PAREN, "Expect '(' after function name.");
   if (!check(TOKEN_RIGHT_PAREN)) {
     do {
+      bool isVarargs = match(TOKEN_STAR);
       consume(TOKEN_IDENTIFIER, "Expect parameter name.");
       if (hasDuplicateParam(paramNames, paramCount, &parser.previous)) {
         error("Duplicate parameter name.");
       }
       paramNames[paramCount++] = parser.previous;
-      if (match(TOKEN_EQUAL)) {
+      if (isVarargs) {
+        if (sawVarargs) {
+          error("Can't have more than one varargs parameter.");
+        }
+        if (match(TOKEN_EQUAL)) {
+          error("Varargs parameter cannot have a default value.");
+        }
+        sawVarargs = true;
+      } else if (sawVarargs) {
+        error("Parameters cannot follow varargs parameter.");
+      } else if (match(TOKEN_EQUAL)) {
         expression(); // Evaluated in outer scope
         defaultsCount++;
       } else if (defaultsCount > 0) {
@@ -1162,11 +1194,19 @@ static void function(FunctionType type) {
   consume(TOKEN_LEFT_PAREN, "Expect '(' after function name.");
   if (!check(TOKEN_RIGHT_PAREN)) {
     do {
-      current->function->arity++;
+      bool isVarargs = match(TOKEN_STAR);
       consume(TOKEN_IDENTIFIER, "Expect parameter name.");
+      if (!isVarargs) {
+        current->function->arity++;
+      } else {
+        current->function->hasVarargs = true;
+      }
       addLocal(parser.previous);
       current->locals[current->localCount - 1].depth = current->scopeDepth;
       if (match(TOKEN_EQUAL)) {
+        if (isVarargs) {
+          error("Varargs parameter cannot have a default value.");
+        }
         // Skip expression as it was already parsed in outer scope
         int bracketLevel = 0;
         while (bracketLevel > 0 ||

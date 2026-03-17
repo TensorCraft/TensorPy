@@ -23,9 +23,21 @@ static InterpretResult run();
 static bool raiseException(Value exception);
 static void resetStack(void);
 static Value importModuleValue(ObjString* moduleName);
-static InterpretResult interpretInGlobals(const char* source, const char* filename, Table* globals);
-static ObjFunction* bindFunctionForFrame(ObjFunction* function, CallFrame* frame);
-static void syncFrameLocalToGlobals(CallFrame* frame, int slot);
+static InterpretResult interpretInGlobals(const char* source, const char* filename, ObjEnvironment* env);
+static ObjClosure* bindFunctionForFrame(ObjFunction* function, CallFrame* frame);
+static void syncFrameLocalToEnv(CallFrame* frame, int slot);
+static bool environmentGet(ObjEnvironment* env, Value key, Value* value);
+static void environmentSetLocal(ObjEnvironment* env, Value key, Value value);
+static ObjEnvironment* currentGlobalEnv(CallFrame* frame);
+static void markValue(Value value);
+static void markObject(Obj* object);
+static void markTable(Table* table);
+static void markValueArray(ValueArray* array);
+static void markRoots(void);
+static void clearMarks(void);
+static int countMarkedObjects(void);
+static void markRootsForCollection(void);
+static void updateNextGC(void);
 
 static char* readFileToBuffer(const char* path) {
     return platformReadTextFile(path);
@@ -148,11 +160,11 @@ static void defineGlobalClass(const char* name, const char* superName) {
     if (superName != NULL) {
         Value superValue;
         Value superKey = OBJ_VAL(copyString(superName, (int)strlen(superName)));
-        if (tableGet(&vm.globals, superKey, &superValue) && IS_CLASS(superValue)) {
+        if (tableGet(vm.globalEnv->table, superKey, &superValue) && IS_CLASS(superValue)) {
             klass->superClass = AS_CLASS(superValue);
         }
     }
-    tableSet(&vm.globals, OBJ_VAL(key), OBJ_VAL(klass));
+    tableSet(vm.globalEnv->table, OBJ_VAL(key), OBJ_VAL(klass));
 }
 
 static bool valueToExceptionMessage(Value value, char* buffer, size_t size) {
@@ -178,7 +190,7 @@ static bool valueToExceptionMessage(Value value, char* buffer, size_t size) {
 static Value getExceptionTypeByName(const char* name) {
     Value classValue;
     Value key = OBJ_VAL(copyString(name, (int)strlen(name)));
-    if (tableGet(&vm.globals, key, &classValue)) {
+    if (tableGet(vm.globalEnv->table, key, &classValue)) {
         return classValue;
     }
     return NIL_VAL;
@@ -208,13 +220,33 @@ static Value createExceptionValue(const char* className, const char* message) {
     return OBJ_VAL(newExceptionInstance(AS_CLASS(classValue), message));
 }
 
-static ObjFunction* bindFunctionForFrame(ObjFunction* function, CallFrame* frame) {
-    ObjFunction* bound = cloneFunction(function);
-    bound->globals = frame->globals;
-    return bound;
+static bool environmentGet(ObjEnvironment* env, Value key, Value* value) {
+    while (env != NULL) {
+        if (tableGet(env->table, key, value)) {
+            return true;
+        }
+        env = env->parent;
+    }
+    return false;
 }
 
-static void syncFrameLocalToGlobals(CallFrame* frame, int slot) {
+static void environmentSetLocal(ObjEnvironment* env, Value key, Value value) {
+    tableSet(env->table, key, value);
+}
+
+static ObjEnvironment* currentGlobalEnv(CallFrame* frame) {
+    ObjEnvironment* env = frame->env;
+    while (env != NULL && env->parent != NULL) {
+        env = env->parent;
+    }
+    return env != NULL ? env : vm.globalEnv;
+}
+
+static ObjClosure* bindFunctionForFrame(ObjFunction* function, CallFrame* frame) {
+    return newClosure(function, frame->env);
+}
+
+static void syncFrameLocalToEnv(CallFrame* frame, int slot) {
     if (slot < 0 || slot >= frame->function->localNames.count) {
         return;
     }
@@ -224,7 +256,7 @@ static void syncFrameLocalToGlobals(CallFrame* frame, int slot) {
         return;
     }
 
-    tableSet(frame->globals, localName, frame->slots[slot]);
+    environmentSetLocal(frame->env, localName, frame->slots[slot]);
 }
 
 static void formatException(Value exception, char* buffer, size_t size) {
@@ -266,6 +298,205 @@ static bool exceptionMatches(Value exception, Value expectedType) {
         return false;
     }
     return valuesEqual(exception, expectedType);
+}
+
+static void markValue(Value value) {
+    if (!IS_OBJ(value)) {
+        return;
+    }
+    markObject(AS_OBJ(value));
+}
+
+static void markValueArray(ValueArray* array) {
+    for (int i = 0; i < array->count; i++) {
+        markValue(array->values[i]);
+    }
+}
+
+static void markTable(Table* table) {
+    for (int i = 0; i < table->capacity; i++) {
+        Entry* entry = &table->entries[i];
+        if (IS_NIL(entry->key)) {
+            continue;
+        }
+        markValue(entry->key);
+        markValue(entry->value);
+    }
+}
+
+static void markObject(Obj* object) {
+    if (object == NULL || object->isMarked) {
+        return;
+    }
+
+    object->isMarked = true;
+
+    switch (object->type) {
+        case OBJ_STRING:
+        case OBJ_NATIVE:
+        case OBJ_BYTES:
+            return;
+        case OBJ_FUNCTION: {
+            ObjFunction* function = (ObjFunction*)object;
+            markValueArray(&function->defaults);
+            markValueArray(&function->paramNames);
+            markValueArray(&function->localNames);
+            markValueArray(&function->chunk.constants);
+            if (function->name != NULL) {
+                markObject((Obj*)function->name);
+            }
+            return;
+        }
+        case OBJ_CLOSURE: {
+            ObjClosure* closure = (ObjClosure*)object;
+            markObject((Obj*)closure->function);
+            markObject((Obj*)closure->env);
+            return;
+        }
+        case OBJ_ENVIRONMENT: {
+            ObjEnvironment* env = (ObjEnvironment*)object;
+            markObject((Obj*)env->parent);
+            if (env->table != NULL) {
+                markTable(env->table);
+            }
+            return;
+        }
+        case OBJ_SET:
+            markTable(&((ObjSet*)object)->table);
+            return;
+        case OBJ_LIST:
+            markValueArray(&((ObjList*)object)->items);
+            return;
+        case OBJ_DICT:
+            markTable(&((ObjDict*)object)->table);
+            return;
+        case OBJ_TUPLE:
+            markValueArray(&((ObjTuple*)object)->items);
+            return;
+        case OBJ_CLASS: {
+            ObjClass* klass = (ObjClass*)object;
+            markObject((Obj*)klass->name);
+            markObject((Obj*)klass->superClass);
+            markTable(&klass->methods);
+            return;
+        }
+        case OBJ_INSTANCE: {
+            ObjInstance* instance = (ObjInstance*)object;
+            markObject((Obj*)instance->klass);
+            markTable(&instance->fields);
+            return;
+        }
+        case OBJ_BOUND_METHOD: {
+            ObjBoundMethod* bound = (ObjBoundMethod*)object;
+            markValue(bound->receiver);
+            markValue(bound->method);
+            return;
+        }
+        case OBJ_SLICE: {
+            ObjSlice* slice = (ObjSlice*)object;
+            markValue(slice->start);
+            markValue(slice->stop);
+            markValue(slice->step);
+            return;
+        }
+        case OBJ_ITERATOR:
+            markValue(((ObjIterator*)object)->iterable);
+            return;
+    }
+}
+
+static void markRoots(void) {
+    for (Value* slot = vm.stack; slot < vm.stackTop; slot++) {
+        markValue(*slot);
+    }
+
+    for (int i = 0; i < vm.frameCount; i++) {
+        CallFrame* frame = &vm.frames[i];
+        markObject((Obj*)frame->closure);
+        markObject((Obj*)frame->function);
+        markObject((Obj*)frame->env);
+    }
+
+    for (int i = 0; i < vm.handlerCount; i++) {
+        markValue(vm.handlers[i].expectedType);
+    }
+
+    markObject((Obj*)vm.globalEnv);
+    markObject((Obj*)vm.initString);
+    markObject((Obj*)vm.moduleClass);
+    markTable(&vm.modules);
+    markTable(&vm.strings);
+}
+
+static void markRootsForCollection(void) {
+    for (Value* slot = vm.stack; slot < vm.stackTop; slot++) {
+        markValue(*slot);
+    }
+
+    for (int i = 0; i < vm.frameCount; i++) {
+        CallFrame* frame = &vm.frames[i];
+        markObject((Obj*)frame->closure);
+        markObject((Obj*)frame->function);
+        markObject((Obj*)frame->env);
+    }
+
+    for (int i = 0; i < vm.handlerCount; i++) {
+        markValue(vm.handlers[i].expectedType);
+    }
+
+    markObject((Obj*)vm.globalEnv);
+    markObject((Obj*)vm.initString);
+    markObject((Obj*)vm.moduleClass);
+    markTable(&vm.modules);
+}
+
+static void clearMarks(void) {
+    for (Obj* object = vm.objects; object != NULL; object = object->next) {
+        object->isMarked = false;
+    }
+}
+
+static int countMarkedObjects(void) {
+    int count = 0;
+    for (Obj* object = vm.objects; object != NULL; object = object->next) {
+        if (object->isMarked) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void updateNextGC(void) {
+    vm.nextGC = vm.objectCount < 64 ? 64 : vm.objectCount * 2;
+}
+
+int gcMarkRootsAndCount(void) {
+    clearMarks();
+    markRoots();
+    int count = countMarkedObjects();
+    clearMarks();
+    return count;
+}
+
+int gcCountReachableFromValue(Value value) {
+    clearMarks();
+    markValue(value);
+    int count = countMarkedObjects();
+    clearMarks();
+    return count;
+}
+
+int gcCollect(void) {
+    clearMarks();
+    markRootsForCollection();
+    tableRemoveWhite(&vm.strings);
+    int freed = sweepUnmarkedObjects();
+    updateNextGC();
+    return freed;
+}
+
+int gcObjectCount(void) {
+    return countObjects();
 }
 
 static bool raiseException(Value exception) {
@@ -360,9 +591,13 @@ static void registerBuiltinHelpers(void) {
 void initVM() {
     resetStack();
     vm.objects = NULL;
-    initTable(&vm.globals);
+    vm.objectCount = 0;
+    vm.nextGC = 64;
+    vm.gcPauseDepth = 1;
+    vm.gcEnabled = false;
     initTable(&vm.modules);
     initTable(&vm.strings);
+    vm.globalEnv = newEnvironment(NULL);
     
     vm.initString = NULL; // Prevent GC from seeing garbage
     vm.initString = copyString("__init__", 8);
@@ -378,13 +613,18 @@ void initVM() {
     defineGlobalClass("AttributeError", "Exception");
     defineGlobalClass("ZeroDivisionError", "Exception");
     registerBuiltinHelpers();
+    vm.gcEnabled = true;
+    vm.gcPauseDepth = 0;
+    updateNextGC();
 }
 
 void freeVM() {
-    freeTable(&vm.globals);
+    freeObjects();
     freeTable(&vm.modules);
     freeTable(&vm.strings);
-    // freeObjects(); // TODO: Implement object list cleanup
+    vm.globalEnv = NULL;
+    vm.initString = NULL;
+    vm.moduleClass = NULL;
 }
 
 void push(Value value) {
@@ -413,7 +653,23 @@ static bool isFalsey(Value value) {
     return false;
 }
 
-static bool call(ObjFunction* function, int argCount) {
+static bool call(ObjClosure* closure, int argCount) {
+    ObjFunction* function = closure->function;
+    int normalizedArgCount = argCount;
+    if (function->hasVarargs) {
+        int fixedArity = function->arity;
+        int extraCount = argCount > fixedArity ? argCount - fixedArity : 0;
+        ObjTuple* varargs = newTuple();
+        Value* argBase = vm.stackTop - argCount;
+        for (int i = 0; i < extraCount; i++) {
+            writeValueArray(&varargs->items, argBase[fixedArity + i]);
+        }
+        vm.stackTop = argBase + fixedArity;
+        push(OBJ_VAL(varargs));
+        normalizedArgCount = fixedArity + 1;
+        argCount = fixedArity;
+    }
+
     if (argCount < function->arity) {
         int defaultsRequired = function->arity - argCount;
         if (defaultsRequired <= function->defaultsCount) {
@@ -422,6 +678,7 @@ static bool call(ObjFunction* function, int argCount) {
                 push(function->defaults.values[i]);
             }
             argCount = function->arity;
+            normalizedArgCount = function->arity + (function->hasVarargs ? 1 : 0);
         } else {
             if (argCount < function->paramNames.count) {
                 runtimeError("Missing required argument '%s'.",
@@ -442,29 +699,23 @@ static bool call(ObjFunction* function, int argCount) {
     }
 
     CallFrame* frame = &vm.frames[vm.frameCount++];
+    frame->closure = closure;
     frame->function = function;
     frame->ip = function->chunk.code;
-    frame->slots = vm.stackTop - argCount - 1;
+    frame->slots = vm.stackTop - normalizedArgCount - 1;
     if (function->name == NULL) {
-        frame->globals = function->globals != NULL ? function->globals : &vm.globals;
+        frame->env = closure->env != NULL ? closure->env : vm.globalEnv;
     } else {
-        Table* globals = (Table*)malloc(sizeof(Table));
-        initTable(globals);
-        if (function->globals != NULL) {
-            tableAddAll(function->globals, globals);
-        } else {
-            tableAddAll(&vm.globals, globals);
-        }
-        frame->globals = globals;
+        frame->env = newEnvironment(closure->env != NULL ? closure->env : vm.globalEnv);
     }
 
     // Reserve space for locals
-    for (int i = argCount + 1; i < function->maxSlots; i++) {
+    for (int i = normalizedArgCount + 1; i < function->maxSlots; i++) {
         push(NIL_VAL);
     }
 
     for (int i = 0; i < function->localNames.count && i < function->maxSlots; i++) {
-        syncFrameLocalToGlobals(frame, i);
+        syncFrameLocalToEnv(frame, i);
     }
     return true;
 }
@@ -482,7 +733,7 @@ static bool callValue(Value callee, int argCount) {
                 }
                 vm.stackTop[-argCount] = bound->receiver;
                 vm.stackTop++;
-                return call(bound->method, argCount + 1);
+                return callValue(bound->method, argCount + 1);
             }
             case OBJ_CLASS: {
                 ObjClass* klass = AS_CLASS(callee);
@@ -495,7 +746,7 @@ static bool callValue(Value callee, int argCount) {
                     }
                     vm.stackTop[-argCount - 1] = initializer;
                     vm.stackTop++;
-                    return call(AS_FUNCTION(initializer), argCount + 1);
+                    return callValue(initializer, argCount + 1);
                 } else if (isExceptionClass(klass)) {
                     if (argCount > 1) {
                         runtimeError("Expected 0 or 1 arguments but got %d.", argCount);
@@ -528,8 +779,10 @@ static bool callValue(Value callee, int argCount) {
                 push(result);
                 return true;
             }
+            case OBJ_CLOSURE:
+                return call(AS_CLOSURE(callee), argCount);
             case OBJ_FUNCTION:
-                return call(AS_FUNCTION(callee), argCount);
+                return call(newClosure(AS_FUNCTION(callee), vm.globalEnv), argCount);
             default:
                 break; // Non-callable object type.
         }
@@ -544,6 +797,7 @@ static bool callValueKeyword(Value callee, int posCount, int kwCount) {
         return false;
     }
 
+    ObjClosure* closure = NULL;
     ObjFunction* fn = NULL;
     Value finalCallee = callee;
 
@@ -554,9 +808,17 @@ static bool callValueKeyword(Value callee, int posCount, int kwCount) {
         }
         vm.stackTop[-posCount - 2 * kwCount] = bound->receiver;
         vm.stackTop++;
-        fn = bound->method;
+        finalCallee = bound->method;
+        if (IS_CLOSURE(bound->method)) {
+            closure = AS_CLOSURE(bound->method);
+            fn = closure->function;
+        } else if (IS_FUNCTION(bound->method)) {
+            fn = AS_FUNCTION(bound->method);
+        }
         posCount++;
-        finalCallee = OBJ_VAL(fn);
+    } else if (OBJ_TYPE(callee) == OBJ_CLOSURE) {
+        closure = AS_CLOSURE(callee);
+        fn = closure->function;
     } else if (OBJ_TYPE(callee) == OBJ_FUNCTION) {
         fn = AS_FUNCTION(callee);
     } else if (OBJ_TYPE(callee) == OBJ_CLASS) {
@@ -570,9 +832,14 @@ static bool callValueKeyword(Value callee, int posCount, int kwCount) {
             }
             vm.stackTop[-posCount - 2 * kwCount - 1] = initializer;
             vm.stackTop++;
-            fn = AS_FUNCTION(initializer);
-            posCount++;
             finalCallee = initializer;
+            if (IS_CLOSURE(initializer)) {
+                closure = AS_CLOSURE(initializer);
+                fn = closure->function;
+            } else if (IS_FUNCTION(initializer)) {
+                fn = AS_FUNCTION(initializer);
+            }
+            posCount++;
         } else {
             if (isExceptionClass(klass)) {
                 if (kwCount > 0) {
@@ -623,9 +890,14 @@ static bool callValueKeyword(Value callee, int posCount, int kwCount) {
 
     Value finalArgs[256];
     bool provided[256] = {false};
+    int extraPosCount = 0;
 
     for (int i = 0; i < posCount; i++) {
         if (i >= fn->arity) {
+            if (fn->hasVarargs) {
+                extraPosCount = posCount - fn->arity;
+                break;
+            }
             runtimeError("Too many positional arguments.");
             return false;
         }
@@ -677,7 +949,19 @@ static bool callValueKeyword(Value callee, int posCount, int kwCount) {
 
     push(finalCallee);
     for (int i = 0; i < fn->arity; i++) push(finalArgs[i]);
-    return call(fn, fn->arity);
+    if (fn->hasVarargs && extraPosCount > 0) {
+        for (int i = 0; i < extraPosCount; i++) {
+            push(posArgs[fn->arity + i]);
+        }
+        if (closure != NULL) {
+            return call(closure, fn->arity + extraPosCount);
+        }
+        return call(newClosure(fn, vm.globalEnv), fn->arity + extraPosCount);
+    }
+    if (closure != NULL) {
+        return call(closure, fn->arity);
+    }
+    return call(newClosure(fn, vm.globalEnv), fn->arity);
 }
 
 static bool invokeFromClassKeyword(ObjClass* klass, ObjString* name, int posCount, int kwCount) {
@@ -725,7 +1009,7 @@ static bool invokeFromClass(ObjClass* klass, ObjString* name, int argCount) {
     }
     vm.stackTop[-argCount - 1] = method;
     vm.stackTop++;
-    return call(AS_FUNCTION(method), argCount + 1);
+    return callValue(method, argCount + 1);
 }
 
 static ObjList* tableKeysList(Table* table) {
@@ -1969,7 +2253,7 @@ static bool bindMethod(ObjClass* klass, ObjString* name) {
         return false;
     }
 
-    ObjBoundMethod* bound = newBoundMethod(peek(0), AS_FUNCTION(method));
+    ObjBoundMethod* bound = newBoundMethod(peek(0), method);
     pop();
     push(OBJ_VAL(bound));
     return true;
@@ -2005,7 +2289,8 @@ static Value importModuleValue(ObjString* moduleName) {
     tableSet(&module->fields, OBJ_VAL(copyString("__name__", 8)), OBJ_VAL(moduleName));
     tableSet(&vm.modules, OBJ_VAL(moduleName), moduleValue);
 
-    InterpretResult result = interpretInGlobals(source, moduleName->chars, &module->fields);
+    ObjEnvironment* moduleEnv = newEnvironmentWithTable(vm.globalEnv, &module->fields);
+    InterpretResult result = interpretInGlobals(source, moduleName->chars, moduleEnv);
     free(source);
     if (result != INTERPRET_OK) {
         tableDelete(&vm.modules, OBJ_VAL(moduleName));
@@ -2107,15 +2392,14 @@ static InterpretResult run() {
             case OP_SET_LOCAL: {
                 uint8_t slot = READ_BYTE();
                 frame->slots[slot] = peek(0);
-                syncFrameLocalToGlobals(frame, slot);
+                syncFrameLocalToEnv(frame, slot);
                 break;
             }
             case OP_GET_GLOBAL: {
                 Value constant = READ_CONSTANT();
                 ObjString* name = AS_STRING(constant);
                 Value value;
-                if (!tableGet(frame->globals, OBJ_VAL(name), &value) &&
-                    !tableGet(&vm.globals, OBJ_VAL(name), &value)) {
+                if (!environmentGet(frame->env, OBJ_VAL(name), &value)) {
                     RUNTIME_ERROR("Undefined variable '%s'.", name->chars);
                 }
                 push(value);
@@ -2123,13 +2407,13 @@ static InterpretResult run() {
             }
             case OP_DEFINE_GLOBAL: {
                 ObjString* name = AS_STRING(READ_CONSTANT());
-                tableSet(frame->globals, OBJ_VAL(name), peek(0));
+                environmentSetLocal(frame->env, OBJ_VAL(name), peek(0));
                 pop();
                 break;
             }
             case OP_SET_GLOBAL: {
                 ObjString* name = AS_STRING(READ_CONSTANT());
-                tableSet(frame->globals, OBJ_VAL(name), peek(0));
+                environmentSetLocal(frame->env, OBJ_VAL(name), peek(0));
                 break;
             }
             case OP_EQUAL: {
@@ -2797,7 +3081,9 @@ static InterpretResult run() {
             }
             case OP_SET_DEFAULTS: {
                 uint8_t count = READ_BYTE();
-                ObjFunction* function = AS_FUNCTION(peek(0));
+                ObjFunction* function = IS_CLOSURE(peek(0))
+                    ? AS_CLOSURE(peek(0))->function
+                    : AS_FUNCTION(peek(0));
                 for (int i = 0; i < count; i++) {
                     writeValueArray(&function->defaults, peek(count - i));
                 }
@@ -2821,7 +3107,7 @@ static InterpretResult run() {
                     if (expectedTypeIndex != UINT8_MAX) {
                         Value typeName = frame->function->chunk.constants.values[expectedTypeIndex];
                         Value resolvedType;
-                        if (!tableGet(&vm.globals, typeName, &resolvedType)) {
+                        if (!tableGet(currentGlobalEnv(frame)->table, typeName, &resolvedType)) {
                             if (raiseException(createExceptionValue("RuntimeError", "Unknown exception type."))) {
                                 HANDLE_RE();
                             }
@@ -2893,14 +3179,19 @@ static InterpretResult run() {
 #undef BINARY_OP
 }
 
-static InterpretResult interpretInGlobals(const char* source, const char* filename, Table* globals) {
+static InterpretResult interpretInGlobals(const char* source, const char* filename, ObjEnvironment* env) {
     Value* stackStart = vm.stackTop;
+    vm.gcPauseDepth++;
     ObjFunction* function = compile(source, filename);
-    if (function == NULL) return INTERPRET_COMPILE_ERROR;
+    if (function == NULL) {
+        vm.gcPauseDepth--;
+        return INTERPRET_COMPILE_ERROR;
+    }
 
-    function->globals = globals;
-    push(OBJ_VAL(function));
-    call(function, 0);
+    ObjClosure* closure = newClosure(function, env);
+    push(OBJ_VAL(closure));
+    vm.gcPauseDepth--;
+    call(closure, 0);
 
     InterpretResult result = run();
     if (result == INTERPRET_OK) {
@@ -2910,5 +3201,5 @@ static InterpretResult interpretInGlobals(const char* source, const char* filena
 }
 
 InterpretResult interpret(const char* source, const char* filename) {
-    return interpretInGlobals(source, filename, &vm.globals);
+    return interpretInGlobals(source, filename, vm.globalEnv);
 }

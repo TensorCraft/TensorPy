@@ -159,3 +159,15 @@ void tableAddAll(Table* from, Table* to) {
         }
     }
 }
+
+void tableRemoveWhite(Table* table) {
+    for (int i = 0; i < table->capacity; i++) {
+        Entry* entry = &table->entries[i];
+        if (IS_NIL(entry->key)) {
+            continue;
+        }
+        if (IS_OBJ(entry->key) && !AS_OBJ(entry->key)->isMarked) {
+            tableDelete(table, entry->key);
+        }
+    }
+}

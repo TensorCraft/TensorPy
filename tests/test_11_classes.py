@@ -45,3 +45,16 @@ class Foo:
 li = [Foo(10), Foo(20)]
 li[0].show()
 li[1].show()
+
+
+class Collector:
+    def gather(self, head, *rest):
+        print(head)
+        print(len(rest))
+        return rest
+
+
+c = Collector()
+print(c.gather(1))
+print(c.gather(1, 2, 3))
+print(c.gather(head=4))
