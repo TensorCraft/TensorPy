@@ -51,3 +51,22 @@ try:
         print("Should not catch")
 except ValueError:
     print("Reraised typed value error")
+
+try:
+    raise ValueError("bad value")
+except Exception as e:
+    print("Caught via Exception")
+    print(type(e))
+    print(e.message)
+    print(len(e.args))
+    print(e.args[0])
+    print(isinstance(e, Exception))
+    print(isinstance(e, ValueError))
+
+try:
+    raise KeyError
+except Exception as e:
+    print("Caught empty message")
+    print(type(e))
+    print(e.message)
+    print(len(e.args))

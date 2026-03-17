@@ -8,7 +8,9 @@ This project is still in an active build-out phase. The goal right now is practi
 
 - Python-like syntax for expressions, functions, classes, conditionals, loops, slicing, and container literals
 - Core data structures: `list`, `tuple`, `dict`, `set`, `str`, `bytes`
-- Typed exceptions with `try` / `except`
+- Typed exceptions with `try` / `except`, including `except Exception as e`
+- Improved function call semantics for keyword arguments, duplicate parameter checks, and missing-argument reporting
+- Basic nested-function closure capture for outer bindings
 - REPL plus file execution
 - Basic module imports:
   - `import module`
@@ -43,6 +45,12 @@ This project is still in an active build-out phase. The goal right now is practi
   - module cache is active across repeated imports
   - package imports now support `pkg`, `pkg.mod`, and `from pkg.mod import name`
   - package submodules are attached back onto parent package objects
+- `Phase 3`: completed
+  - exception matching and exception objects were made more Python-like
+  - function call argument checking and keyword handling were tightened
+  - nested functions now capture outer bindings
+  - `json` validation and `re` alternation support received a second pass
+  - REPL multi-line block input was improved
 
 ## Implemented Library Surface
 
@@ -94,6 +102,7 @@ Supported regex constructs currently include:
 - literals
 - `.`
 - `^` and `$`
+- top-level alternation with `|`
 - `*`, `+`, `?`
 - character classes like `[abc]`
 - ranges like `[a-z]`
@@ -171,7 +180,7 @@ Run the full test suite:
 python3 run_tests.py
 ```
 
-At the time of writing, the suite contains `27` organized test files and passes in the current workspace.
+At the time of writing, the suite contains `29` organized test files and passes in the current workspace.
 
 ## Project Layout
 

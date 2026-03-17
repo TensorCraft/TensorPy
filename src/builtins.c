@@ -32,6 +32,16 @@ static bool valueMatchesTypeName(Value value, ObjString* name) {
     }
 }
 
+static bool classMatchesExpected(ObjClass* klass, ObjClass* expected) {
+    while (klass != NULL) {
+        if (klass == expected) {
+            return true;
+        }
+        klass = klass->superClass;
+    }
+    return false;
+}
+
 static bool getAttributeValue(Value object, ObjString* name, Value* result) {
     if (IS_INSTANCE(object)) {
         ObjInstance* instance = AS_INSTANCE(object);
@@ -261,7 +271,7 @@ static Value isinstanceNative(int argCount, Value* args) {
 
     if (IS_CLASS(args[1])) {
         if (IS_INSTANCE(args[0])) {
-            return BOOL_VAL(AS_INSTANCE(args[0])->klass == AS_CLASS(args[1]));
+            return BOOL_VAL(classMatchesExpected(AS_INSTANCE(args[0])->klass, AS_CLASS(args[1])));
         }
         return BOOL_VAL(false);
     }

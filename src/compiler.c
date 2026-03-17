@@ -253,6 +253,15 @@ static ObjFunction *endCompiler() {
   emitReturn();
   ObjFunction *function = current->function;
   function->maxSlots = current->maxSlots;
+  for (int i = 0; i < current->localCount; i++) {
+    Local *local = &current->locals[i];
+    if (local->name.length == 0) {
+      writeValueArray(&function->localNames, NIL_VAL);
+    } else {
+      writeValueArray(&function->localNames,
+                      OBJ_VAL(copyString(local->name.start, local->name.length)));
+    }
+  }
 
 #ifdef DEBUG_PRINT_CODE
   if (!parser.hadError) {
@@ -279,6 +288,20 @@ static void importStatement(void);
 static void fromImportStatement(void);
 
 static bool check(TokenType type) { return parser.current.type == type; }
+
+static bool tokenNamesEqual(Token* a, Token* b) {
+  return a->length == b->length &&
+         memcmp(a->start, b->start, (size_t)a->length) == 0;
+}
+
+static bool hasDuplicateParam(Token* params, int count, Token* candidate) {
+  for (int i = 0; i < count; i++) {
+    if (tokenNamesEqual(&params[i], candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 static uint8_t identifierConstant(Token* name) {
   return makeConstant(OBJ_VAL(copyString(name->start, name->length)));
@@ -383,6 +406,9 @@ static void lambdaExpression(bool canAssign) {
     if (!check(TOKEN_COLON)) {
         do {
             consume(TOKEN_IDENTIFIER, "Expect parameter name.");
+            if (hasDuplicateParam(paramNames, paramCount, &parser.previous)) {
+                error("Duplicate parameter name.");
+            }
             paramNames[paramCount++] = parser.previous;
             if (match(TOKEN_EQUAL)) {
                 expression(); // Evaluated in outer scope
@@ -1102,6 +1128,9 @@ static void function(FunctionType type) {
   if (!check(TOKEN_RIGHT_PAREN)) {
     do {
       consume(TOKEN_IDENTIFIER, "Expect parameter name.");
+      if (hasDuplicateParam(paramNames, paramCount, &parser.previous)) {
+        error("Duplicate parameter name.");
+      }
       paramNames[paramCount++] = parser.previous;
       if (match(TOKEN_EQUAL)) {
         expression(); // Evaluated in outer scope
@@ -1435,12 +1464,19 @@ static void tryStatement() {
   consume(TOKEN_EXCEPT, "Expect 'except' after try block.");
 
   uint8_t typeConstant = UINT8_MAX;
+  bool hasBinding = false;
+  Token bindingName;
   if (match(TOKEN_COLON)) {
     // Catch all.
   } else {
     consume(TOKEN_IDENTIFIER, "Expect exception type after 'except'.");
     typeConstant = makeConstant(
         OBJ_VAL(copyString(parser.previous.start, parser.previous.length)));
+    if (match(TOKEN_AS)) {
+      consume(TOKEN_IDENTIFIER, "Expect binding name after 'as'.");
+      hasBinding = true;
+      bindingName = parser.previous;
+    }
     consume(TOKEN_COLON, "Expect ':' after exception type.");
   }
 
@@ -1449,9 +1485,11 @@ static void tryStatement() {
   while (match(TOKEN_NEWLINE))
     ;
   
-  // When an exception is caught, the message is on top of the stack
-  // We pop it for now as we don't have 'as e' implemented yet.
-  emitByte(OP_POP); 
+  if (hasBinding) {
+    storeName(bindingName);
+  } else {
+    emitByte(OP_POP);
+  }
 
   if (match(TOKEN_INDENT)) {
     block();

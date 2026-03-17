@@ -11,3 +11,13 @@ print(jl("[1,2,3]")[2])
 from json import JSON
 parser = JSON("{\"x\":5}")
 print(parser.parse()["x"])
+
+try:
+    json.loads("{\"a\": 1} trailing")
+except ValueError as e:
+    print(e.message)
+
+try:
+    json.loads("[1 2]")
+except ValueError as e:
+    print(e.message)

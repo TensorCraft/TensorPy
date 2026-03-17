@@ -6,7 +6,11 @@ class JSON:
 
     def parse(self):
         self.skip()
-        return self.value()
+        value = self.value()
+        self.skip()
+        if self.i != len(self.s):
+            raise ValueError("Extra data")
+        return value
 
     def skip(self):
         while self.i < len(self.s):
@@ -18,6 +22,8 @@ class JSON:
 
     def value(self):
         self.skip()
+        if self.i >= len(self.s):
+            raise ValueError("Unexpected end of JSON input")
         c = self.s[self.i]
 
         if c == "{":
@@ -71,18 +77,24 @@ class JSON:
             self.i = self.i + 1
 
         value = 0
+        saw_digit = False
         while self.i < len(self.s):
             c = self.s[self.i]
             digit = _digit_value(c)
             if digit != -1:
                 value = value * 10 + digit
                 self.i = self.i + 1
+                saw_digit = True
             else:
                 break
+
+        if not saw_digit:
+            raise ValueError("Invalid number")
 
         if self.i < len(self.s) and self.s[self.i] == ".":
             self.i = self.i + 1
             factor = 0.1
+            saw_fraction = False
             while self.i < len(self.s):
                 c = self.s[self.i]
                 digit = _digit_value(c)
@@ -90,8 +102,11 @@ class JSON:
                     value = value + digit * factor
                     factor = factor / 10
                     self.i = self.i + 1
+                    saw_fraction = True
                 else:
                     break
+            if not saw_fraction:
+                raise ValueError("Invalid number")
 
         return value * sign
 
@@ -107,9 +122,13 @@ class JSON:
         while True:
             out.append(self.value())
             self.skip()
+            if self.i >= len(self.s):
+                raise ValueError("Unterminated array")
             if self.s[self.i] == "]":
                 self.i = self.i + 1
                 break
+            if self.s[self.i] != ",":
+                raise ValueError("Expected ',' or ']' in array")
             self.i = self.i + 1
 
         return out
@@ -124,14 +143,22 @@ class JSON:
             return out
 
         while True:
+            if self.i >= len(self.s) or self.s[self.i] != "\"":
+                raise ValueError("Expected string key")
             key = self.string()
             self.skip()
+            if self.i >= len(self.s) or self.s[self.i] != ":":
+                raise ValueError("Expected ':' after key")
             self.i = self.i + 1
             out[key] = self.value()
             self.skip()
+            if self.i >= len(self.s):
+                raise ValueError("Unterminated object")
             if self.s[self.i] == "}":
                 self.i = self.i + 1
                 break
+            if self.s[self.i] != ",":
+                raise ValueError("Expected ',' or '}' in object")
             self.i = self.i + 1
 
         return out

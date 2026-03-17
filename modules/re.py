@@ -47,6 +47,56 @@ def _slice_text(text, start, end):
     return out
 
 
+def _find_group_end(pattern, start):
+    depth = 1
+    i = start
+    in_class = False
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            i = i + 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]":
+            in_class = False
+        elif not in_class and c == "(":
+            depth = depth + 1
+        elif not in_class and c == ")":
+            depth = depth - 1
+            if depth == 0:
+                return i
+        i = i + 1
+    return -1
+
+
+def _split_alternatives(pattern, start, end):
+    parts = []
+    part_start = start
+    depth = 0
+    in_class = False
+    i = start
+    while i < end:
+        c = pattern[i]
+        if c == "\\":
+            i = i + 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]":
+            in_class = False
+        elif not in_class and c == "(":
+            depth = depth + 1
+        elif not in_class and c == ")":
+            depth = depth - 1
+        elif not in_class and depth == 0 and c == "|":
+            parts.append((part_start, i))
+            part_start = i + 1
+        i = i + 1
+    parts.append((part_start, end))
+    return parts
+
+
 def _parse_class(pattern, i):
     negate = False
     if i < len(pattern) and pattern[i] == "^":
@@ -133,37 +183,70 @@ def _atom_matches(atom, c):
     return False
 
 
-def _match_sequence(pattern, pi, text, ti):
-    if pi >= len(pattern):
+def _match_pattern_range(pattern, start, end, text, ti):
+    parts = _split_alternatives(pattern, start, end)
+    if len(parts) == 1:
+        return _match_sequence(pattern, start, end, text, ti)
+
+    for part in parts:
+        result = _match_sequence(pattern, part[0], part[1], text, ti)
+        if result != -1:
+            return result
+    return -1
+
+
+def _match_sequence(pattern, pi, end_pi, text, ti):
+    if pi >= end_pi:
         return ti
 
-    if pattern[pi] == "$" and pi + 1 == len(pattern):
+    if pattern[pi] == "$" and pi + 1 == end_pi:
         if ti == len(text):
             return ti
         return -1
 
-    parsed = _parse_atom(pattern, pi)
-    atom = parsed[0]
-    next_pi = parsed[1]
+    atom = None
+    group_bounds = None
+    if pattern[pi] == "(":
+        group_end = _find_group_end(pattern, pi + 1)
+        if group_end == -1:
+            return -1
+        group_bounds = (pi + 1, group_end)
+        next_pi = group_end + 1
+    else:
+        parsed = _parse_atom(pattern, pi)
+        atom = parsed[0]
+        next_pi = parsed[1]
 
     quant = ""
-    if next_pi < len(pattern):
+    if next_pi < end_pi:
         q = pattern[next_pi]
         if q == "*" or q == "+" or q == "?":
             quant = q
             next_pi = next_pi + 1
 
+    if group_bounds is not None and quant != "":
+        return -1
+
+    def _match_one(current_ti):
+        if group_bounds is not None:
+            return _match_pattern_range(pattern, group_bounds[0], group_bounds[1], text, current_ti)
+        if current_ti < len(text) and _atom_matches(atom, text[current_ti]):
+            return current_ti + 1
+        return -1
+
     if quant == "":
-        if ti < len(text) and _atom_matches(atom, text[ti]):
-            return _match_sequence(pattern, next_pi, text, ti + 1)
+        single_end = _match_one(ti)
+        if single_end != -1:
+            return _match_sequence(pattern, next_pi, end_pi, text, single_end)
         return -1
 
     if quant == "?":
-        if ti < len(text) and _atom_matches(atom, text[ti]):
-            end = _match_sequence(pattern, next_pi, text, ti + 1)
+        single_end = _match_one(ti)
+        if single_end != -1:
+            end = _match_sequence(pattern, next_pi, end_pi, text, single_end)
             if end != -1:
                 return end
-        return _match_sequence(pattern, next_pi, text, ti)
+        return _match_sequence(pattern, next_pi, end_pi, text, ti)
 
     min_count = 0
     if quant == "+":
@@ -171,19 +254,28 @@ def _match_sequence(pattern, pi, text, ti):
 
     cur = ti
     count = 0
-    while cur < len(text) and _atom_matches(atom, text[cur]):
-        cur = cur + 1
+    while True:
+        next_cur = _match_one(cur)
+        if next_cur == -1 or next_cur == cur:
+            break
+        cur = next_cur
         count = count + 1
 
     if count < min_count:
         return -1
 
-    min_cur = ti + min_count
-    while cur >= min_cur:
-        end = _match_sequence(pattern, next_pi, text, cur)
+    min_positions = [ti]
+    cur = ti
+    while len(min_positions) <= count:
+        cur = _match_one(cur)
+        min_positions.append(cur)
+
+    idx = count
+    while idx >= min_count:
+        end = _match_sequence(pattern, next_pi, end_pi, text, min_positions[idx])
         if end != -1:
             return end
-        cur = cur - 1
+        idx = idx - 1
 
     return -1
 
@@ -198,14 +290,14 @@ def _search_bounds(pattern, text, start_pos):
     if anchored:
         if start_pos != 0:
             return None
-        end = _match_sequence(pattern, pi, text, 0)
+        end = _match_pattern_range(pattern, pi, len(pattern), text, 0)
         if end == -1:
             return None
         return (0, end)
 
     pos = start_pos
     while pos <= len(text):
-        end = _match_sequence(pattern, pi, text, pos)
+        end = _match_pattern_range(pattern, pi, len(pattern), text, pos)
         if end != -1:
             return (pos, end)
         pos = pos + 1

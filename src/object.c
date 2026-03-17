@@ -95,9 +95,17 @@ ObjFunction* newFunction() {
     function->globals = NULL;
     initValueArray(&function->defaults);
     initValueArray(&function->paramNames);
+    initValueArray(&function->localNames);
     function->name = NULL;
     initChunk(&function->chunk);
     return function;
+}
+
+ObjFunction* cloneFunction(ObjFunction* function) {
+    ObjFunction* clone = ALLOCATE_OBJ(ObjFunction, OBJ_FUNCTION);
+    *clone = *function;
+    clone->globals = NULL;
+    return clone;
 }
 
 ObjNative* newNative(NativeFn function) {
@@ -133,6 +141,7 @@ ObjTuple* newTuple() {
 ObjClass* newClass(ObjString* name) {
     ObjClass* klass = ALLOCATE_OBJ(ObjClass, OBJ_CLASS);
     klass->name = name;
+    klass->superClass = NULL;
     initTable(&klass->methods);
     return klass;
 }

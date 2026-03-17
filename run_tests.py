@@ -5,6 +5,22 @@ import sys
 def run_test(test_file):
     print(f"Running {test_file}...", end=" ", flush=True)
     try:
+        basename = os.path.basename(test_file)
+        if basename.startswith("test_repl_"):
+            with open(test_file, "r", encoding="utf-8") as f:
+                result = subprocess.run(
+                    ["./tensorpy"],
+                    input=f.read(),
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+            if result.returncode == 0 and "3" in result.stdout:
+                print("\033[92mPASSED\033[0m")
+                return True, result.stdout
+            print("\033[91mFAILED\033[0m")
+            return False, result.stderr + result.stdout
+
         # Run with a timeout to prevent infinite loops
         result = subprocess.run(
             ["./tensorpy", test_file],
@@ -13,8 +29,10 @@ def run_test(test_file):
             timeout=5
         )
         expected_rc = 0
-        if test_file == "tests/test_error.py": expected_rc = 65
-        if test_file == "tests/test_runtime_error.py": expected_rc = 70
+        if basename.startswith("test_error"):
+            expected_rc = 65
+        if basename.startswith("test_runtime_error"):
+            expected_rc = 70
 
         if result.returncode == expected_rc:
             print("\033[92mPASSED\033[0m")

@@ -67,16 +67,57 @@ static bool isLikelyExpression(const char* line) {
     return true;
 }
 
+static bool isBlankLine(const char* line) {
+    while (*line != '\0') {
+        if (*line != ' ' && *line != '\t' && *line != '\n' && *line != '\r') {
+            return false;
+        }
+        line++;
+    }
+    return true;
+}
+
+static bool lineStartsBlock(const char* line) {
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == ' ' || line[len - 1] == '\t')) {
+        len--;
+    }
+    return len > 0 && line[len - 1] == ':';
+}
+
 static void repl() {
     char line[1024];
     char wrapped[1152];
+    char block[8192];
+    block[0] = '\0';
+    bool collecting = false;
     for (;;) {
-        printf("> ");
+        printf(collecting ? "... " : "> ");
         fflush(stdout);
 
         if (!fgets(line, sizeof(line), stdin)) {
+            if (collecting && block[0] != '\0') {
+                interpret(block, "stdin");
+            }
             printf("\n");
             break;
+        }
+
+        if (collecting) {
+            if (isBlankLine(line)) {
+                interpret(block, "stdin");
+                block[0] = '\0';
+                collecting = false;
+                continue;
+            }
+            strncat(block, line, sizeof(block) - strlen(block) - 1);
+            continue;
+        }
+
+        if (lineStartsBlock(line)) {
+            strncat(block, line, sizeof(block) - strlen(block) - 1);
+            collecting = true;
+            continue;
         }
 
         if (isLikelyExpression(line)) {

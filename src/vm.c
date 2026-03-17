@@ -24,6 +24,7 @@ static bool raiseException(Value exception);
 static void resetStack(void);
 static Value importModuleValue(ObjString* moduleName);
 static InterpretResult interpretInGlobals(const char* source, const char* filename, Table* globals);
+static ObjFunction* bindFunctionForFrame(ObjFunction* function, CallFrame* frame);
 
 static char* readFileToBuffer(const char* path) {
     return platformReadTextFile(path);
@@ -111,9 +112,46 @@ static bool tryImportModuleProperty(ObjInstance* instance, ObjString* name, Valu
     return true;
 }
 
-static void defineGlobalClass(const char* name) {
+static bool isClassOrSubclass(ObjClass* klass, ObjClass* expected) {
+    while (klass != NULL) {
+        if (klass == expected) {
+            return true;
+        }
+        klass = klass->superClass;
+    }
+    return false;
+}
+
+static Value makeExceptionArgsTuple(const char* message) {
+    ObjTuple* args = newTuple();
+    if (message != NULL) {
+        writeValueArray(&args->items, OBJ_VAL(copyString(message, (int)strlen(message))));
+    }
+    return OBJ_VAL(args);
+}
+
+static ObjInstance* newExceptionInstance(ObjClass* klass, const char* message) {
+    ObjInstance* instance = newInstance(klass);
+    Value messageKey = OBJ_VAL(copyString("message", 7));
+    const char* storedMessage = message != NULL ? message : "";
+    tableSet(&instance->fields, messageKey,
+             OBJ_VAL(copyString(storedMessage, (int)strlen(storedMessage))));
+    Value argsKey = OBJ_VAL(copyString("args", 4));
+    tableSet(&instance->fields, argsKey, makeExceptionArgsTuple(message));
+    return instance;
+}
+
+static void defineGlobalClass(const char* name, const char* superName) {
     ObjString* key = copyString(name, (int)strlen(name));
-    tableSet(&vm.globals, OBJ_VAL(key), OBJ_VAL(newClass(key)));
+    ObjClass* klass = newClass(key);
+    if (superName != NULL) {
+        Value superValue;
+        Value superKey = OBJ_VAL(copyString(superName, (int)strlen(superName)));
+        if (tableGet(&vm.globals, superKey, &superValue) && IS_CLASS(superValue)) {
+            klass->superClass = AS_CLASS(superValue);
+        }
+    }
+    tableSet(&vm.globals, OBJ_VAL(key), OBJ_VAL(klass));
 }
 
 static bool valueToExceptionMessage(Value value, char* buffer, size_t size) {
@@ -145,17 +183,58 @@ static Value getExceptionTypeByName(const char* name) {
     return NIL_VAL;
 }
 
+static bool isExceptionClass(ObjClass* klass) {
+    Value exceptionType = getExceptionTypeByName("Exception");
+    return IS_CLASS(exceptionType) && isClassOrSubclass(klass, AS_CLASS(exceptionType));
+}
+
+static const char* exceptionMessageArg(Value value, char* buffer, size_t size) {
+    if (IS_STRING(value)) {
+        return AS_STRING(value)->chars;
+    }
+    if (valueToExceptionMessage(value, buffer, size)) {
+        return buffer;
+    }
+    return NULL;
+}
+
 static Value createExceptionValue(const char* className, const char* message) {
     Value classValue = getExceptionTypeByName(className);
     if (!IS_CLASS(classValue)) {
         return OBJ_VAL(copyString(message, (int)strlen(message)));
     }
 
-    ObjInstance* instance = newInstance(AS_CLASS(classValue));
-    Value messageKey = OBJ_VAL(copyString("message", 7));
-    tableSet(&instance->fields, messageKey,
-             OBJ_VAL(copyString(message, (int)strlen(message))));
-    return OBJ_VAL(instance);
+    return OBJ_VAL(newExceptionInstance(AS_CLASS(classValue), message));
+}
+
+static Table* captureFrameGlobals(CallFrame* frame) {
+    Table* captured = (Table*)malloc(sizeof(Table));
+    initTable(captured);
+    tableAddAll(frame->globals, captured);
+
+    for (int i = 0; i < frame->function->localNames.count; i++) {
+        Value localName = frame->function->localNames.values[i];
+        if (!IS_STRING(localName)) {
+            continue;
+        }
+        ObjString* name = AS_STRING(localName);
+        if (name->length == 0) {
+            continue;
+        }
+        tableSet(captured, localName, frame->slots[i]);
+    }
+
+    return captured;
+}
+
+static ObjFunction* bindFunctionForFrame(ObjFunction* function, CallFrame* frame) {
+    ObjFunction* bound = cloneFunction(function);
+    if (frame->function->name == NULL) {
+        bound->globals = frame->globals;
+    } else {
+        bound->globals = captureFrameGlobals(frame);
+    }
+    return bound;
 }
 
 static void formatException(Value exception, char* buffer, size_t size) {
@@ -164,10 +243,12 @@ static void formatException(Value exception, char* buffer, size_t size) {
         Value message;
         Value messageKey = OBJ_VAL(copyString("message", 7));
         if (tableGet(&instance->fields, messageKey, &message) && IS_STRING(message)) {
-            snprintf(buffer, size, "%s: %s", instance->klass->name->chars, AS_STRING(message)->chars);
-        } else {
-            snprintf(buffer, size, "%s", instance->klass->name->chars);
+            if (AS_STRING(message)->length > 0) {
+                snprintf(buffer, size, "%s: %s", instance->klass->name->chars, AS_STRING(message)->chars);
+                return;
+            }
         }
+        snprintf(buffer, size, "%s", instance->klass->name->chars);
         return;
     }
     if (IS_CLASS(exception)) {
@@ -187,10 +268,10 @@ static bool exceptionMatches(Value exception, Value expectedType) {
     if (IS_NIL(expectedType)) return true;
     if (IS_CLASS(expectedType)) {
         if (IS_INSTANCE(exception)) {
-            return AS_INSTANCE(exception)->klass == AS_CLASS(expectedType);
+            return isClassOrSubclass(AS_INSTANCE(exception)->klass, AS_CLASS(expectedType));
         }
         if (IS_CLASS(exception)) {
-            return AS_CLASS(exception) == AS_CLASS(expectedType);
+            return isClassOrSubclass(AS_CLASS(exception), AS_CLASS(expectedType));
         }
         return false;
     }
@@ -298,14 +379,14 @@ void initVM() {
     vm.moduleClass = newClass(copyString("module", 6));
 
     registerBuiltins();
-    defineGlobalClass("Exception");
-    defineGlobalClass("RuntimeError");
-    defineGlobalClass("TypeError");
-    defineGlobalClass("ValueError");
-    defineGlobalClass("KeyError");
-    defineGlobalClass("IndexError");
-    defineGlobalClass("AttributeError");
-    defineGlobalClass("ZeroDivisionError");
+    defineGlobalClass("Exception", NULL);
+    defineGlobalClass("RuntimeError", "Exception");
+    defineGlobalClass("TypeError", "Exception");
+    defineGlobalClass("ValueError", "Exception");
+    defineGlobalClass("KeyError", "Exception");
+    defineGlobalClass("IndexError", "Exception");
+    defineGlobalClass("AttributeError", "Exception");
+    defineGlobalClass("ZeroDivisionError", "Exception");
     registerBuiltinHelpers();
 }
 
@@ -352,7 +433,12 @@ static bool call(ObjFunction* function, int argCount) {
             }
             argCount = function->arity;
         } else {
-            runtimeError("Expected %d arguments but got %d.", function->arity, argCount);
+            if (argCount < function->paramNames.count) {
+                runtimeError("Missing required argument '%s'.",
+                             AS_CSTRING(function->paramNames.values[argCount]));
+            } else {
+                runtimeError("Expected %d arguments but got %d.", function->arity, argCount);
+            }
             return false;
         }
     } else if (argCount > function->arity) {
@@ -405,6 +491,25 @@ static bool callValue(Value callee, int argCount) {
                     vm.stackTop[-argCount - 1] = initializer;
                     vm.stackTop++;
                     return call(AS_FUNCTION(initializer), argCount + 1);
+                } else if (isExceptionClass(klass)) {
+                    if (argCount > 1) {
+                        runtimeError("Expected 0 or 1 arguments but got %d.", argCount);
+                        return false;
+                    }
+
+                    char buffer[256];
+                    const char* message = NULL;
+                    if (argCount == 1) {
+                        message = exceptionMessageArg(peek(0), buffer, sizeof(buffer));
+                        if (message == NULL) {
+                            runtimeError("Exception message must be a string or simple value.");
+                            return false;
+                        }
+                    }
+
+                    vm.stackTop[-argCount - 1] = OBJ_VAL(newExceptionInstance(klass, message));
+                    vm.stackTop -= argCount;
+                    return true;
                 } else if (argCount != 0) {
                     runtimeError("Expected 0 arguments but got %d.", argCount);
                     return false;
@@ -464,6 +569,30 @@ static bool callValueKeyword(Value callee, int posCount, int kwCount) {
             posCount++;
             finalCallee = initializer;
         } else {
+            if (isExceptionClass(klass)) {
+                if (kwCount > 0) {
+                    runtimeError("Builtin exception constructors do not accept keyword arguments.");
+                    return false;
+                }
+                if (posCount > 1) {
+                    runtimeError("Expected 0 or 1 arguments but got %d.", posCount);
+                    return false;
+                }
+
+                char buffer[256];
+                const char* message = NULL;
+                if (posCount == 1) {
+                    message = exceptionMessageArg(peek(0), buffer, sizeof(buffer));
+                    if (message == NULL) {
+                        runtimeError("Exception message must be a string or simple value.");
+                        return false;
+                    }
+                }
+
+                vm.stackTop[-posCount - 1] = OBJ_VAL(newExceptionInstance(klass, message));
+                vm.stackTop -= posCount;
+                return true;
+            }
             if (posCount > 0 || kwCount > 0) {
                 runtimeError("Expected 0 arguments but got some.");
                 return false;
@@ -1955,8 +2084,8 @@ static InterpretResult run() {
         switch (instruction = READ_BYTE()) {
             case OP_CONSTANT: {
                 Value constant = READ_CONSTANT();
-                if (IS_FUNCTION(constant) && AS_FUNCTION(constant)->globals == NULL) {
-                    AS_FUNCTION(constant)->globals = frame->globals;
+                if (IS_FUNCTION(constant)) {
+                    constant = OBJ_VAL(bindFunctionForFrame(AS_FUNCTION(constant), frame));
                 }
                 push(constant);
                 break;
@@ -2712,7 +2841,7 @@ static InterpretResult run() {
                         HANDLE_RE();
                     }
                 } else if (IS_CLASS(exception)) {
-                    if (raiseException(OBJ_VAL(newInstance(AS_CLASS(exception))))) {
+                    if (raiseException(OBJ_VAL(newExceptionInstance(AS_CLASS(exception), NULL)))) {
                         HANDLE_RE();
                     }
                 } else if (IS_INSTANCE(exception)) {
