@@ -98,3 +98,30 @@ def make_pair_sum():
 
 
 print("closure list sum =", make_pair_sum()())
+
+
+def capture_rebind():
+    x = 1
+
+    def inner():
+        return x
+
+    x = 9
+    return inner
+
+
+print("closure rebind =", capture_rebind()())
+
+
+def loop_closures():
+    funcs = []
+    for i in [1, 2]:
+        def current():
+            return i
+        funcs.append(current)
+    return funcs
+
+
+loop_funcs = loop_closures()
+print("loop closure 1 =", loop_funcs[0]())
+print("loop closure 2 =", loop_funcs[1]())

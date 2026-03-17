@@ -25,6 +25,7 @@ static void resetStack(void);
 static Value importModuleValue(ObjString* moduleName);
 static InterpretResult interpretInGlobals(const char* source, const char* filename, Table* globals);
 static ObjFunction* bindFunctionForFrame(ObjFunction* function, CallFrame* frame);
+static void syncFrameLocalToGlobals(CallFrame* frame, int slot);
 
 static char* readFileToBuffer(const char* path) {
     return platformReadTextFile(path);
@@ -207,34 +208,23 @@ static Value createExceptionValue(const char* className, const char* message) {
     return OBJ_VAL(newExceptionInstance(AS_CLASS(classValue), message));
 }
 
-static Table* captureFrameGlobals(CallFrame* frame) {
-    Table* captured = (Table*)malloc(sizeof(Table));
-    initTable(captured);
-    tableAddAll(frame->globals, captured);
-
-    for (int i = 0; i < frame->function->localNames.count; i++) {
-        Value localName = frame->function->localNames.values[i];
-        if (!IS_STRING(localName)) {
-            continue;
-        }
-        ObjString* name = AS_STRING(localName);
-        if (name->length == 0) {
-            continue;
-        }
-        tableSet(captured, localName, frame->slots[i]);
-    }
-
-    return captured;
-}
-
 static ObjFunction* bindFunctionForFrame(ObjFunction* function, CallFrame* frame) {
     ObjFunction* bound = cloneFunction(function);
-    if (frame->function->name == NULL) {
-        bound->globals = frame->globals;
-    } else {
-        bound->globals = captureFrameGlobals(frame);
-    }
+    bound->globals = frame->globals;
     return bound;
+}
+
+static void syncFrameLocalToGlobals(CallFrame* frame, int slot) {
+    if (slot < 0 || slot >= frame->function->localNames.count) {
+        return;
+    }
+
+    Value localName = frame->function->localNames.values[slot];
+    if (!IS_STRING(localName)) {
+        return;
+    }
+
+    tableSet(frame->globals, localName, frame->slots[slot]);
 }
 
 static void formatException(Value exception, char* buffer, size_t size) {
@@ -455,11 +445,26 @@ static bool call(ObjFunction* function, int argCount) {
     frame->function = function;
     frame->ip = function->chunk.code;
     frame->slots = vm.stackTop - argCount - 1;
-    frame->globals = function->globals != NULL ? function->globals : &vm.globals;
+    if (function->name == NULL) {
+        frame->globals = function->globals != NULL ? function->globals : &vm.globals;
+    } else {
+        Table* globals = (Table*)malloc(sizeof(Table));
+        initTable(globals);
+        if (function->globals != NULL) {
+            tableAddAll(function->globals, globals);
+        } else {
+            tableAddAll(&vm.globals, globals);
+        }
+        frame->globals = globals;
+    }
 
     // Reserve space for locals
     for (int i = argCount + 1; i < function->maxSlots; i++) {
         push(NIL_VAL);
+    }
+
+    for (int i = 0; i < function->localNames.count && i < function->maxSlots; i++) {
+        syncFrameLocalToGlobals(frame, i);
     }
     return true;
 }
@@ -2102,6 +2107,7 @@ static InterpretResult run() {
             case OP_SET_LOCAL: {
                 uint8_t slot = READ_BYTE();
                 frame->slots[slot] = peek(0);
+                syncFrameLocalToGlobals(frame, slot);
                 break;
             }
             case OP_GET_GLOBAL: {

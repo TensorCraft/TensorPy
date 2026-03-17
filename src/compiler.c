@@ -84,6 +84,19 @@ Compiler *current = NULL;
 
 static Chunk *currentChunk() { return &current->function->chunk; }
 
+static void recordLocalName(int slot, Token name) {
+  while (current->function->localNames.count <= slot) {
+    writeValueArray(&current->function->localNames, NIL_VAL);
+  }
+
+  if (name.length == 0) {
+    current->function->localNames.values[slot] = NIL_VAL;
+  } else {
+    current->function->localNames.values[slot] =
+        OBJ_VAL(copyString(name.start, name.length));
+  }
+}
+
 static void errorAt(Token *token, const char *message) {
   if (parser.hadError)
     return;
@@ -247,21 +260,13 @@ static void initCompiler(Compiler *compiler, FunctionType type) {
     local->name.start = "";
     local->name.length = 0;
   }
+  recordLocalName(0, local->name);
 }
 
 static ObjFunction *endCompiler() {
   emitReturn();
   ObjFunction *function = current->function;
   function->maxSlots = current->maxSlots;
-  for (int i = 0; i < current->localCount; i++) {
-    Local *local = &current->locals[i];
-    if (local->name.length == 0) {
-      writeValueArray(&function->localNames, NIL_VAL);
-    } else {
-      writeValueArray(&function->localNames,
-                      OBJ_VAL(copyString(local->name.start, local->name.length)));
-    }
-  }
 
 #ifdef DEBUG_PRINT_CODE
   if (!parser.hadError) {
@@ -693,10 +698,12 @@ static void subscript(bool canAssign) {
 }
 
 static void addLocal(Token name) {
+  int slot = current->localCount;
   Local *local = &current->locals[current->localCount++];
   if (current->localCount > current->maxSlots) current->maxSlots = current->localCount;
   local->name = name;
   local->depth = -1; // "uninitialized"
+  recordLocalName(slot, name);
 }
 
 static int resolveLocal(Compiler *compiler, Token *name) {
