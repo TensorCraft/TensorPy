@@ -92,6 +92,7 @@ ObjFunction* newFunction() {
     function->arity = 0;
     function->defaultsCount = 0;
     function->maxSlots = 0;
+    function->globals = NULL;
     initValueArray(&function->defaults);
     initValueArray(&function->paramNames);
     function->name = NULL;

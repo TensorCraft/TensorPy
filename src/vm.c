@@ -11,6 +11,7 @@
 #include "tensorpy/compiler.h"
 #include "tensorpy/debug.h"
 #include "tensorpy/object.h"
+#include "tensorpy/platform.h"
 #include "tensorpy/scanner.h"
 #include "tensorpy/vm.h"
 
@@ -22,53 +23,92 @@ static InterpretResult run();
 static bool raiseException(Value exception);
 static void resetStack(void);
 static Value importModuleValue(ObjString* moduleName);
+static InterpretResult interpretInGlobals(const char* source, const char* filename, Table* globals);
 
 static char* readFileToBuffer(const char* path) {
-    FILE* file = fopen(path, "rb");
-    if (file == NULL) {
-        return NULL;
-    }
+    return platformReadTextFile(path);
+}
 
-    fseek(file, 0L, SEEK_END);
-    size_t fileSize = ftell(file);
-    rewind(file);
-
-    char* buffer = (char*)malloc(fileSize + 1);
-    size_t bytesRead = fread(buffer, sizeof(char), fileSize, file);
-    fclose(file);
-    if (bytesRead < fileSize) {
-        free(buffer);
-        return NULL;
+static char* moduleNameToPath(const char* moduleName) {
+    size_t length = strlen(moduleName);
+    char* path = (char*)malloc(length + 1);
+    for (size_t i = 0; i < length; i++) {
+        path[i] = moduleName[i] == '.' ? '/' : moduleName[i];
     }
-    buffer[bytesRead] = '\0';
-    return buffer;
+    path[length] = '\0';
+    return path;
 }
 
 static char* readModuleFile(const char* moduleName) {
+    char* normalized = moduleNameToPath(moduleName);
     const char* roots[] = {"modules", "lib", "."};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
-        size_t pathLen = strlen(roots[i]) + 1 + strlen(moduleName) + 3;
+        size_t pathLen = strlen(roots[i]) + 1 + strlen(normalized) + 3;
         char* path = (char*)malloc(pathLen + 1);
-        snprintf(path, pathLen + 1, "%s/%s.py", roots[i], moduleName);
+        snprintf(path, pathLen + 1, "%s/%s.py", roots[i], normalized);
 
         char* source = readFileToBuffer(path);
         free(path);
         if (source != NULL) {
+            free(normalized);
+            return source;
+        }
+
+        pathLen = strlen(roots[i]) + 1 + strlen(normalized) + 12;
+        path = (char*)malloc(pathLen + 1);
+        snprintf(path, pathLen + 1, "%s/%s/__init__.py", roots[i], normalized);
+        source = readFileToBuffer(path);
+        free(path);
+        if (source != NULL) {
+            free(normalized);
             return source;
         }
     }
 
-    size_t fallbackLen = strlen(moduleName) + 3;
+    size_t fallbackLen = strlen(normalized) + 3;
     char* fallback = (char*)malloc(fallbackLen + 1);
-    snprintf(fallback, fallbackLen + 1, "%s.py", moduleName);
+    snprintf(fallback, fallbackLen + 1, "%s.py", normalized);
     char* source = readFileToBuffer(fallback);
     free(fallback);
+    free(normalized);
     return source;
 }
 
-static void snapshotTable(Table* from, Table* to) {
-    initTable(to);
-    tableAddAll(from, to);
+static ObjString* parentModuleName(ObjString* moduleName) {
+    const char* dot = strrchr(moduleName->chars, '.');
+    if (dot == NULL) return NULL;
+    return copyString(moduleName->chars, (int)(dot - moduleName->chars));
+}
+
+static ObjString* childModuleName(ObjString* moduleName) {
+    const char* dot = strrchr(moduleName->chars, '.');
+    if (dot == NULL) return NULL;
+    return copyString(dot + 1, (int)strlen(dot + 1));
+}
+
+static bool tryImportModuleProperty(ObjInstance* instance, ObjString* name, Value* value) {
+    if (instance->klass != vm.moduleClass) {
+        return false;
+    }
+
+    Value moduleNameValue;
+    Value moduleNameKey = OBJ_VAL(copyString("__name__", 8));
+    if (!tableGet(&instance->fields, moduleNameKey, &moduleNameValue) || !IS_STRING(moduleNameValue)) {
+        return false;
+    }
+
+    ObjString* moduleName = AS_STRING(moduleNameValue);
+    int fullLength = moduleName->length + 1 + name->length;
+    char* fullName = (char*)malloc((size_t)fullLength + 1);
+    snprintf(fullName, (size_t)fullLength + 1, "%s.%s", moduleName->chars, name->chars);
+    ObjString* fullModuleName = takeString(fullName, fullLength);
+    *value = importModuleValue(fullModuleName);
+    if (IS_NIL(*value)) {
+        return false;
+    }
+
+    tableSet(&instance->fields, OBJ_VAL(name), *value);
+    return true;
 }
 
 static void defineGlobalClass(const char* name) {
@@ -209,6 +249,43 @@ static bool runtimeError(const char* format, ...) {
     return raiseException(createExceptionValue("RuntimeError", buffer));
 }
 
+static void registerBuiltinHelpers(void) {
+    const char* source =
+        "def reversed(seq):\n"
+        "    out = []\n"
+        "    i = len(seq) - 1\n"
+        "    while i >= 0:\n"
+        "        out.append(seq[i])\n"
+        "        i = i - 1\n"
+        "    return out\n"
+        "\n"
+        "def zip(a, b):\n"
+        "    out = []\n"
+        "    limit = len(a)\n"
+        "    if len(b) < limit:\n"
+        "        limit = len(b)\n"
+        "    i = 0\n"
+        "    while i < limit:\n"
+        "        out.append((a[i], b[i]))\n"
+        "        i = i + 1\n"
+        "    return out\n"
+        "\n"
+        "def map(func, seq):\n"
+        "    out = []\n"
+        "    for item in seq:\n"
+        "        out.append(func(item))\n"
+        "    return out\n"
+        "\n"
+        "def filter(func, seq):\n"
+        "    out = []\n"
+        "    for item in seq:\n"
+        "        if func(item):\n"
+        "            out.append(item)\n"
+        "    return out\n";
+
+    interpret(source, "<builtins>");
+}
+
 void initVM() {
     resetStack();
     vm.objects = NULL;
@@ -229,6 +306,7 @@ void initVM() {
     defineGlobalClass("IndexError");
     defineGlobalClass("AttributeError");
     defineGlobalClass("ZeroDivisionError");
+    registerBuiltinHelpers();
 }
 
 void freeVM() {
@@ -291,6 +369,7 @@ static bool call(ObjFunction* function, int argCount) {
     frame->function = function;
     frame->ip = function->chunk.code;
     frame->slots = vm.stackTop - argCount - 1;
+    frame->globals = function->globals != NULL ? function->globals : &vm.globals;
 
     // Reserve space for locals
     for (int i = argCount + 1; i < function->maxSlots; i++) {
@@ -1768,36 +1847,40 @@ static Value importModuleValue(ObjString* moduleName) {
         return cached;
     }
 
-    char* source = readModuleFile(moduleName->chars);
-    if (source == NULL) {
-        raiseException(createExceptionValue("RuntimeError", "Module not found."));
-        return NIL_VAL;
+    ObjString* parentName = parentModuleName(moduleName);
+    Value parentModule = NIL_VAL;
+    ObjString* childName = NULL;
+    if (parentName != NULL) {
+        parentModule = importModuleValue(parentName);
+        if (IS_NIL(parentModule)) {
+            return NIL_VAL;
+        }
+        childName = childModuleName(moduleName);
     }
 
-    Table before;
-    snapshotTable(&vm.globals, &before);
-    InterpretResult result = interpret(source, moduleName->chars);
-    free(source);
-    if (result != INTERPRET_OK) {
-        freeTable(&before);
+    char* source = readModuleFile(moduleName->chars);
+    if (source == NULL) {
+        char buffer[512];
+        snprintf(buffer, sizeof(buffer), "Module not found: %s", moduleName->chars);
+        raiseException(createExceptionValue("RuntimeError", buffer));
         return NIL_VAL;
     }
 
     ObjInstance* module = newInstance(vm.moduleClass);
-    for (int i = 0; i < vm.globals.capacity; i++) {
-        Entry* entry = &vm.globals.entries[i];
-        if (IS_NIL(entry->key)) continue;
-
-        Value oldValue;
-        bool existed = tableGet(&before, entry->key, &oldValue);
-        if (!existed || !valuesEqual(oldValue, entry->value)) {
-            tableSet(&module->fields, entry->key, entry->value);
-        }
-    }
-    freeTable(&before);
-
     Value moduleValue = OBJ_VAL(module);
+    tableSet(&module->fields, OBJ_VAL(copyString("__name__", 8)), OBJ_VAL(moduleName));
     tableSet(&vm.modules, OBJ_VAL(moduleName), moduleValue);
+
+    InterpretResult result = interpretInGlobals(source, moduleName->chars, &module->fields);
+    free(source);
+    if (result != INTERPRET_OK) {
+        tableDelete(&vm.modules, OBJ_VAL(moduleName));
+        return NIL_VAL;
+    }
+
+    if (parentName != NULL && IS_INSTANCE(parentModule) && childName != NULL) {
+        tableSet(&AS_INSTANCE(parentModule)->fields, OBJ_VAL(childName), moduleValue);
+    }
     return moduleValue;
 }
 
@@ -1872,6 +1955,9 @@ static InterpretResult run() {
         switch (instruction = READ_BYTE()) {
             case OP_CONSTANT: {
                 Value constant = READ_CONSTANT();
+                if (IS_FUNCTION(constant) && AS_FUNCTION(constant)->globals == NULL) {
+                    AS_FUNCTION(constant)->globals = frame->globals;
+                }
                 push(constant);
                 break;
             }
@@ -1893,7 +1979,8 @@ static InterpretResult run() {
                 Value constant = READ_CONSTANT();
                 ObjString* name = AS_STRING(constant);
                 Value value;
-                if (!tableGet(&vm.globals, OBJ_VAL(name), &value)) {
+                if (!tableGet(frame->globals, OBJ_VAL(name), &value) &&
+                    !tableGet(&vm.globals, OBJ_VAL(name), &value)) {
                     RUNTIME_ERROR("Undefined variable '%s'.", name->chars);
                 }
                 push(value);
@@ -1901,13 +1988,13 @@ static InterpretResult run() {
             }
             case OP_DEFINE_GLOBAL: {
                 ObjString* name = AS_STRING(READ_CONSTANT());
-                tableSet(&vm.globals, OBJ_VAL(name), peek(0));
+                tableSet(frame->globals, OBJ_VAL(name), peek(0));
                 pop();
                 break;
             }
             case OP_SET_GLOBAL: {
                 ObjString* name = AS_STRING(READ_CONSTANT());
-                tableSet(&vm.globals, OBJ_VAL(name), peek(0));
+                tableSet(frame->globals, OBJ_VAL(name), peek(0));
                 break;
             }
             case OP_EQUAL: {
@@ -2534,6 +2621,11 @@ static InterpretResult run() {
                     push(value);
                     break;
                 }
+                if (tryImportModuleProperty(instance, name, &value)) {
+                    pop();
+                    push(value);
+                    break;
+                }
                 if (!bindMethod(instance->klass, name)) {
                     HANDLE_RE();
                 }
@@ -2666,11 +2758,12 @@ static InterpretResult run() {
 #undef BINARY_OP
 }
 
-InterpretResult interpret(const char* source, const char* filename) {
+static InterpretResult interpretInGlobals(const char* source, const char* filename, Table* globals) {
     Value* stackStart = vm.stackTop;
     ObjFunction* function = compile(source, filename);
     if (function == NULL) return INTERPRET_COMPILE_ERROR;
 
+    function->globals = globals;
     push(OBJ_VAL(function));
     call(function, 0);
 
@@ -2679,4 +2772,8 @@ InterpretResult interpret(const char* source, const char* filename) {
         vm.stackTop = stackStart;
     }
     return result;
+}
+
+InterpretResult interpret(const char* source, const char* filename) {
+    return interpretInGlobals(source, filename, &vm.globals);
 }

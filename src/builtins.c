@@ -1,12 +1,62 @@
 #include <stdio.h>
-#include <time.h>
 #include <string.h>
+#include <math.h>
+#include <stdlib.h>
 
 #include "tensorpy/common.h"
 #include "tensorpy/object.h"
+#include "tensorpy/platform.h"
 #include "tensorpy/value.h"
 #include "tensorpy/vm.h"
 #include "tensorpy/builtins.h"
+
+static bool valueMatchesTypeName(Value value, ObjString* name) {
+    const char* typeName = name->chars;
+
+    if (IS_BOOL(value)) return strcmp(typeName, "bool") == 0;
+    if (IS_NIL(value)) return strcmp(typeName, "NoneType") == 0;
+    if (IS_NUMBER(value)) return strcmp(typeName, "float") == 0;
+    if (!IS_OBJ(value)) return false;
+
+    switch (OBJ_TYPE(value)) {
+        case OBJ_STRING: return strcmp(typeName, "str") == 0;
+        case OBJ_NATIVE: return strcmp(typeName, "builtin_function_or_method") == 0;
+        case OBJ_SET: return strcmp(typeName, "set") == 0;
+        case OBJ_LIST: return strcmp(typeName, "list") == 0;
+        case OBJ_DICT: return strcmp(typeName, "dict") == 0;
+        case OBJ_TUPLE: return strcmp(typeName, "tuple") == 0;
+        case OBJ_BYTES: return strcmp(typeName, "bytes") == 0;
+        case OBJ_CLASS: return strcmp(typeName, "type") == 0;
+        case OBJ_INSTANCE: return strcmp(AS_INSTANCE(value)->klass->name->chars, typeName) == 0;
+        default: return strcmp(typeName, "object") == 0;
+    }
+}
+
+static bool getAttributeValue(Value object, ObjString* name, Value* result) {
+    if (IS_INSTANCE(object)) {
+        ObjInstance* instance = AS_INSTANCE(object);
+        if (tableGet(&instance->fields, OBJ_VAL(name), result)) {
+            return true;
+        }
+
+        Value method;
+        if (tableGet(&instance->klass->methods, OBJ_VAL(name), &method)) {
+            if (IS_FUNCTION(method)) {
+                *result = OBJ_VAL(newBoundMethod(object, AS_FUNCTION(method)));
+            } else {
+                *result = method;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    if (IS_CLASS(object)) {
+        return tableGet(&AS_CLASS(object)->methods, OBJ_VAL(name), result);
+    }
+
+    return false;
+}
 
 // Built-in: print()
 static Value printNative(int argCount, Value* args) {
@@ -21,7 +71,9 @@ static Value printNative(int argCount, Value* args) {
 
 // Built-in: clock() (useful for benchmarks)
 static Value clockNative(int argCount, Value* args) {
-    return NUMBER_VAL((double)clock() / CLOCKS_PER_SEC);
+    (void)argCount;
+    (void)args;
+    return NUMBER_VAL(platformClockSeconds());
 }
 
 // Built-in: len()
@@ -203,6 +255,158 @@ static Value typeNative(int argCount, Value* args) {
     return NIL_VAL;
 }
 
+// Built-in: isinstance()
+static Value isinstanceNative(int argCount, Value* args) {
+    if (argCount != 2) return BOOL_VAL(false);
+
+    if (IS_CLASS(args[1])) {
+        if (IS_INSTANCE(args[0])) {
+            return BOOL_VAL(AS_INSTANCE(args[0])->klass == AS_CLASS(args[1]));
+        }
+        return BOOL_VAL(false);
+    }
+
+    if (IS_STRING(args[1])) {
+        return BOOL_VAL(valueMatchesTypeName(args[0], AS_STRING(args[1])));
+    }
+
+    return BOOL_VAL(false);
+}
+
+// Built-in: getattr()
+static Value getattrNative(int argCount, Value* args) {
+    if (argCount < 2 || argCount > 3 || !IS_STRING(args[1])) return NIL_VAL;
+
+    Value value;
+    if (getAttributeValue(args[0], AS_STRING(args[1]), &value)) {
+        return value;
+    }
+
+    if (argCount == 3) {
+        return args[2];
+    }
+
+    return NIL_VAL;
+}
+
+// Built-in: hasattr()
+static Value hasattrNative(int argCount, Value* args) {
+    if (argCount != 2 || !IS_STRING(args[1])) return BOOL_VAL(false);
+
+    Value value;
+    return BOOL_VAL(getAttributeValue(args[0], AS_STRING(args[1]), &value));
+}
+
+// Built-in: setattr()
+static Value setattrNative(int argCount, Value* args) {
+    if (argCount != 3 || !IS_STRING(args[1])) return NIL_VAL;
+
+    if (!IS_INSTANCE(args[0])) {
+        return NIL_VAL;
+    }
+
+    tableSet(&AS_INSTANCE(args[0])->fields, args[1], args[2]);
+    return NIL_VAL;
+}
+
+static void appendDirEntries(ObjList* out, Table* table) {
+    for (int i = 0; i < table->capacity; i++) {
+        Entry* entry = &table->entries[i];
+        if (!IS_NIL(entry->key)) {
+            writeValueArray(&out->items, entry->key);
+        }
+    }
+}
+
+// Built-in: round()
+static Value roundNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_NUMBER(args[0])) return NIL_VAL;
+    double value = AS_NUMBER(args[0]);
+    return NUMBER_VAL(floor(value + 0.5));
+}
+
+// Built-in: ord()
+static Value ordNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
+    ObjString* string = AS_STRING(args[0]);
+    if (string->length != 1) return NIL_VAL;
+    return NUMBER_VAL((unsigned char)string->chars[0]);
+}
+
+// Built-in: chr()
+static Value chrNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_NUMBER(args[0])) return NIL_VAL;
+    char chars[2];
+    chars[0] = (char)AS_NUMBER(args[0]);
+    chars[1] = '\0';
+    return OBJ_VAL(copyString(chars, 1));
+}
+
+// Built-in: dir()
+static Value dirNative(int argCount, Value* args) {
+    ObjList* out = newList();
+    if (argCount == 0) {
+        appendDirEntries(out, &vm.globals);
+        return OBJ_VAL(out);
+    }
+
+    if (IS_INSTANCE(args[0])) {
+        ObjInstance* instance = AS_INSTANCE(args[0]);
+        appendDirEntries(out, &instance->fields);
+        appendDirEntries(out, &instance->klass->methods);
+        return OBJ_VAL(out);
+    }
+
+    if (IS_CLASS(args[0])) {
+        appendDirEntries(out, &AS_CLASS(args[0])->methods);
+        return OBJ_VAL(out);
+    }
+
+    return OBJ_VAL(out);
+}
+
+// Internal platform helpers for pure TensorPy modules.
+static Value platformTimeNative(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    return NUMBER_VAL(platformClockSeconds());
+}
+
+static Value platformRandomNative(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    return NUMBER_VAL(platformRandomDouble());
+}
+
+static Value platformGetcwdNative(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    char* cwd = platformGetCurrentDirectory();
+    if (cwd == NULL) return NIL_VAL;
+    ObjString* string = copyString(cwd, (int)strlen(cwd));
+    free(cwd);
+    return OBJ_VAL(string);
+}
+
+static Value platformNameNative(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    const char* name = platformName();
+    return OBJ_VAL(copyString(name, (int)strlen(name)));
+}
+
+static Value mathUnaryNative(int argCount, Value* args, double (*fn)(double)) {
+    if (argCount != 1 || !IS_NUMBER(args[0])) return NIL_VAL;
+    return NUMBER_VAL(fn(AS_NUMBER(args[0])));
+}
+
+static Value mathSqrtNative(int argCount, Value* args) { return mathUnaryNative(argCount, args, sqrt); }
+static Value mathSinNative(int argCount, Value* args) { return mathUnaryNative(argCount, args, sin); }
+static Value mathCosNative(int argCount, Value* args) { return mathUnaryNative(argCount, args, cos); }
+static Value mathTanNative(int argCount, Value* args) { return mathUnaryNative(argCount, args, tan); }
+static Value mathFloorNative(int argCount, Value* args) { return mathUnaryNative(argCount, args, floor); }
+static Value mathCeilNative(int argCount, Value* args) { return mathUnaryNative(argCount, args, ceil); }
+
 int compareValues(const void* a, const void* b) {
     Value va = *(const Value*)a;
     Value vb = *(const Value*)b;
@@ -311,4 +515,22 @@ void registerBuiltins() {
     defineNative("enumerate", enumerateNative);
     defineNative("range", rangeNative);
     defineNative("str", strNative);
+    defineNative("isinstance", isinstanceNative);
+    defineNative("getattr", getattrNative);
+    defineNative("hasattr", hasattrNative);
+    defineNative("setattr", setattrNative);
+    defineNative("round", roundNative);
+    defineNative("ord", ordNative);
+    defineNative("chr", chrNative);
+    defineNative("dir", dirNative);
+    defineNative("__platform_time", platformTimeNative);
+    defineNative("__platform_random", platformRandomNative);
+    defineNative("__platform_getcwd", platformGetcwdNative);
+    defineNative("__platform_name", platformNameNative);
+    defineNative("__math_sqrt", mathSqrtNative);
+    defineNative("__math_sin", mathSinNative);
+    defineNative("__math_cos", mathCosNative);
+    defineNative("__math_tan", mathTanNative);
+    defineNative("__math_floor", mathFloorNative);
+    defineNative("__math_ceil", mathCeilNative);
 }

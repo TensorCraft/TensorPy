@@ -12,15 +12,37 @@ This project is still in an active build-out phase. The goal right now is practi
 - REPL plus file execution
 - Basic module imports:
   - `import module`
+  - `import package.module`
   - `from module import name`
+  - `from package import module`
+  - `from package.module import name`
   - `from module import name as alias`
 - Module lookup currently checks:
   - `modules/<name>.py`
+  - `modules/<pkg>/__init__.py`
   - `lib/<name>.py`
   - `./<name>.py`
 - Builtin-like modules written in TensorPy:
   - `json`
   - `re`
+  - `math`
+  - `time`
+  - `random`
+  - `os`
+- Platform-facing runtime operations are routed through a portability layer in `src/platform.c`
+
+## Milestone Status
+
+- `Phase 1`: completed
+  - common builtins expanded
+  - reflection helpers added
+  - `math`, `time`, `random`, and `os` modules added
+  - platform abstraction layer added for system-facing operations
+- `Phase 2`: completed
+  - module globals are isolated from script globals
+  - module cache is active across repeated imports
+  - package imports now support `pkg`, `pkg.mod`, and `from pkg.mod import name`
+  - package submodules are attached back onto parent package objects
 
 ## Implemented Library Surface
 
@@ -34,6 +56,21 @@ The runtime already includes a practical set of methods for:
 - `bytes`
 
 Examples include methods such as `append`, `pop`, `remove`, `sort`, `setdefault`, `popitem`, `union`, `intersection`, `count`, `index`, `split`, `join`, `encode`, `decode`, and `hex`.
+
+Common builtins now also include:
+
+- `isinstance`
+- `getattr`
+- `setattr`
+- `hasattr`
+- `reversed`
+- `zip`
+- `map`
+- `filter`
+- `round`
+- `ord`
+- `chr`
+- `dir`
 
 The `json` module supports:
 
@@ -134,23 +171,27 @@ Run the full test suite:
 python3 run_tests.py
 ```
 
-At the time of writing, the suite contains `20` organized test files and passes in the current workspace.
+At the time of writing, the suite contains `27` organized test files and passes in the current workspace.
 
 ## Project Layout
 
 - [src/main.c](/Users/tensorcraft/Projects/TensorPy/src/main.c): CLI entry point and REPL
 - [src/compiler.c](/Users/tensorcraft/Projects/TensorPy/src/compiler.c): parser and bytecode compiler
 - [src/vm.c](/Users/tensorcraft/Projects/TensorPy/src/vm.c): virtual machine and runtime behavior
+- [src/platform.c](/Users/tensorcraft/Projects/TensorPy/src/platform.c): portability layer for filesystem, time, random, and OS-facing helpers
 - [modules](/Users/tensorcraft/Projects/TensorPy/modules): TensorPy standard-library-style modules
 - [modules/json.py](/Users/tensorcraft/Projects/TensorPy/modules/json.py): TensorPy JSON module
 - [modules/re.py](/Users/tensorcraft/Projects/TensorPy/modules/re.py): TensorPy regex module
+- [modules/math.py](/Users/tensorcraft/Projects/TensorPy/modules/math.py): TensorPy math module
+- [modules/time.py](/Users/tensorcraft/Projects/TensorPy/modules/time.py): TensorPy time module
+- [modules/random.py](/Users/tensorcraft/Projects/TensorPy/modules/random.py): TensorPy random module
+- [modules/os.py](/Users/tensorcraft/Projects/TensorPy/modules/os.py): TensorPy os module
 - [tests](/Users/tensorcraft/Projects/TensorPy/tests): ordered regression and feature tests
 
 ## Limitations
 
 TensorPy is not yet a full Python implementation. Notable gaps still include:
 
-- incomplete import/package semantics
 - incomplete builtin and standard library coverage
 - partial regex compatibility
 - missing GC work for later phases
@@ -159,9 +200,9 @@ TensorPy is not yet a full Python implementation. Notable gaps still include:
 ## TODO
 
 - expand data-structure method coverage, especially remaining `set`, `tuple`, `str`, and `bytes` behavior gaps
-- add more general builtins such as `zip`, `map`, `filter`, `reversed`, `isinstance`, `getattr`, `setattr`, and `hasattr`
-- improve module loading beyond the current minimal `import` / `from ... import ... as ...` support
-- add package semantics and better module path resolution
+- broaden general builtins beyond the current reflection and iterable helpers
+- extend module loading with richer search rules and better error reporting
+- continue improving package semantics and nested module behavior
 - strengthen exception compatibility, including richer exception objects and more Python-like error messages
 - improve REPL behavior for multi-line input, block handling, and interactive error display
 - expand `json` compatibility and validation behavior

@@ -274,6 +274,7 @@ static uint8_t identifierConstant(Token* name);
 static void storeName(Token name);
 static void addLocal(Token name);
 static int resolveLocal(Compiler *compiler, Token *name);
+static uint8_t dottedPathConstant(Token* first, Token* last);
 static void importStatement(void);
 static void fromImportStatement(void);
 
@@ -281,6 +282,14 @@ static bool check(TokenType type) { return parser.current.type == type; }
 
 static uint8_t identifierConstant(Token* name) {
   return makeConstant(OBJ_VAL(copyString(name->start, name->length)));
+}
+
+static uint8_t dottedPathConstant(Token* first, Token* last) {
+  int length = (int)((last->start + last->length) - first->start);
+  char* path = (char*)malloc((size_t)length + 1);
+  memcpy(path, first->start, (size_t)length);
+  path[length] = '\0';
+  return makeConstant(OBJ_VAL(takeString(path, length)));
 }
 
 static void storeName(Token name) {
@@ -1465,20 +1474,38 @@ static void raiseStatement() {
 
 static void importStatement() {
   consume(TOKEN_IDENTIFIER, "Expect module name after 'import'.");
-  Token moduleName = parser.previous;
-  Token bindName = moduleName;
+  Token firstModuleName = parser.previous;
+  Token lastModuleName = parser.previous;
+  Token bindName = firstModuleName;
+  bool hasDots = false;
+  bool hasAlias = false;
+  while (match(TOKEN_DOT)) {
+    consume(TOKEN_IDENTIFIER, "Expect module name after '.'.");
+    lastModuleName = parser.previous;
+    hasDots = true;
+  }
   if (match(TOKEN_AS)) {
     consume(TOKEN_IDENTIFIER, "Expect alias after 'as'.");
     bindName = parser.previous;
+    hasAlias = true;
   }
 
-  emitBytes(OP_IMPORT_MODULE, identifierConstant(&moduleName));
+  emitBytes(OP_IMPORT_MODULE, dottedPathConstant(&firstModuleName, &lastModuleName));
+  if (hasDots && !hasAlias) {
+    emitByte(OP_POP);
+    emitBytes(OP_IMPORT_MODULE, identifierConstant(&firstModuleName));
+  }
   storeName(bindName);
 }
 
 static void fromImportStatement() {
   consume(TOKEN_IDENTIFIER, "Expect module name after 'from'.");
-  Token moduleName = parser.previous;
+  Token firstModuleName = parser.previous;
+  Token lastModuleName = parser.previous;
+  while (match(TOKEN_DOT)) {
+    consume(TOKEN_IDENTIFIER, "Expect module name after '.'.");
+    lastModuleName = parser.previous;
+  }
   consume(TOKEN_IMPORT, "Expect 'import' after module name.");
   consume(TOKEN_IDENTIFIER, "Expect imported name.");
   Token importedName = parser.previous;
@@ -1488,7 +1515,7 @@ static void fromImportStatement() {
     bindName = parser.previous;
   }
 
-  emitBytes(OP_IMPORT_MODULE, identifierConstant(&moduleName));
+  emitBytes(OP_IMPORT_MODULE, dottedPathConstant(&firstModuleName, &lastModuleName));
   emitBytes(OP_GET_PROPERTY, identifierConstant(&importedName));
   storeName(bindName);
 }
