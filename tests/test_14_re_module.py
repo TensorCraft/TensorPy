@@ -39,3 +39,8 @@ print(g2.end(2))
 
 g3 = re.fullmatch("a(bc)?d", "ad")
 print(g3.group(1) is None)
+
+print(re.fullmatch("(ab){2,3}", "ababab").group())
+print(re.fullmatch("a{2}", "aa").group())
+print(re.fullmatch("[0-9]{2,4}", "123").group())
+print(re.findall("([a-z]+)(\\d+)", "a12 b34"))

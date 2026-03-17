@@ -15,6 +15,7 @@ print(json.loads("{\"n\":1.5e2,\"s\":\"line\\ntext\",\"u\":\"\\u0041\"}")["n"])
 print(json.loads("{\"n\":1.5e2,\"s\":\"line\\ntext\",\"u\":\"\\u0041\"}")["s"])
 print(json.loads("{\"n\":1.5e2,\"s\":\"line\\ntext\",\"u\":\"\\u0041\"}")["u"])
 print(json.dumps({"ctrl": "a\b\f"}))
+print(json.dumps({"unicode": "A" + chr(1) + chr(233)}))
 
 try:
     json.loads("{\"a\": 1} trailing")
@@ -33,5 +34,10 @@ except ValueError as e:
 
 try:
     json.loads("tru")
+except ValueError as e:
+    print(e.message)
+
+try:
+    json.loads("01")
 except ValueError as e:
     print(e.message)

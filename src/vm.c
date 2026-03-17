@@ -38,6 +38,11 @@ static void clearMarks(void);
 static int countMarkedObjects(void);
 static void markRootsForCollection(void);
 static void updateNextGC(void);
+static bool expandIterableArgs(Value iterable, Value* outArgs, int* outCount);
+static bool collectExpandedArgs(Value* sourceArgs, int sourceCount, ObjTuple* starIndexes, Value* outArgs, int* outCount);
+static bool collectExpandedKeywords(Value* kwSourceArgs, int kwSourceCount, ObjTuple* kwStarIndexes,
+                                    Value* explicitKwNames, int explicitKwCount,
+                                    Value* outKwNames, Value* outKwValues, int* outKwCount);
 
 static char* readFileToBuffer(const char* path) {
     return platformReadTextFile(path);
@@ -721,6 +726,75 @@ static bool call(ObjClosure* closure, int argCount) {
 }
 
 static bool callValueKeyword(Value callee, int posCount, int kwCount);
+
+static bool expandIterableArgs(Value iterable, Value* outArgs, int* outCount) {
+    if (IS_LIST(iterable)) {
+        ObjList* list = AS_LIST(iterable);
+        for (int i = 0; i < list->items.count; i++) {
+            outArgs[(*outCount)++] = list->items.values[i];
+        }
+        return true;
+    }
+    if (IS_TUPLE(iterable)) {
+        ObjTuple* tuple = AS_TUPLE(iterable);
+        for (int i = 0; i < tuple->items.count; i++) {
+            outArgs[(*outCount)++] = tuple->items.values[i];
+        }
+        return true;
+    }
+    if (IS_STRING(iterable)) {
+        ObjString* string = AS_STRING(iterable);
+        for (int i = 0; i < string->length; i++) {
+            outArgs[(*outCount)++] = OBJ_VAL(copyString(string->chars + i, 1));
+        }
+        return true;
+    }
+    if (IS_SET(iterable)) {
+        ObjSet* set = AS_SET(iterable);
+        for (int i = 0; i < set->table.capacity; i++) {
+            Entry* entry = &set->table.entries[i];
+            if (!IS_NIL(entry->key)) {
+                outArgs[(*outCount)++] = entry->key;
+            }
+        }
+        return true;
+    }
+    if (IS_DICT(iterable)) {
+        ObjDict* dict = AS_DICT(iterable);
+        for (int i = 0; i < dict->table.capacity; i++) {
+            Entry* entry = &dict->table.entries[i];
+            if (!IS_NIL(entry->key)) {
+                outArgs[(*outCount)++] = entry->key;
+            }
+        }
+        return true;
+    }
+    runtimeError("Object is not iterable.");
+    return false;
+}
+
+static bool collectExpandedArgs(Value* sourceArgs, int sourceCount, ObjTuple* starIndexes, Value* outArgs, int* outCount) {
+    int starCursor = 0;
+    for (int i = 0; i < sourceCount; i++) {
+        bool isStar = false;
+        if (starCursor < starIndexes->items.count) {
+            Value marker = starIndexes->items.values[starCursor];
+            if (IS_NUMBER(marker) && (int)AS_NUMBER(marker) == i) {
+                isStar = true;
+                starCursor++;
+            }
+        }
+
+        if (isStar) {
+            if (!expandIterableArgs(sourceArgs[i], outArgs, outCount)) {
+                return false;
+            }
+        } else {
+            outArgs[(*outCount)++] = sourceArgs[i];
+        }
+    }
+    return true;
+}
 
 static bool callValue(Value callee, int argCount) {
     if (IS_OBJ(callee)) {
@@ -2246,6 +2320,189 @@ static bool invoke(ObjString* name, int argCount) {
     return invokeFromClass(instance->klass, name, argCount);
 }
 
+static bool callValueExpanded(Value callee, int argCount, ObjTuple* starIndexes) {
+    Value sourceArgs[255];
+    for (int i = 0; i < argCount; i++) {
+        sourceArgs[argCount - 1 - i] = pop();
+    }
+    pop();
+
+    Value expandedArgs[255];
+    int expandedCount = 0;
+    if (!collectExpandedArgs(sourceArgs, argCount, starIndexes, expandedArgs, &expandedCount)) {
+        return false;
+    }
+
+    push(callee);
+    for (int i = 0; i < expandedCount; i++) {
+        push(expandedArgs[i]);
+    }
+    return callValue(callee, expandedCount);
+}
+
+static bool invokeExpanded(ObjString* name, int argCount, ObjTuple* starIndexes) {
+    Value sourceArgs[255];
+    for (int i = 0; i < argCount; i++) {
+        sourceArgs[argCount - 1 - i] = pop();
+    }
+    Value receiver = pop();
+
+    Value expandedArgs[255];
+    int expandedCount = 0;
+    if (!collectExpandedArgs(sourceArgs, argCount, starIndexes, expandedArgs, &expandedCount)) {
+        return false;
+    }
+
+    push(receiver);
+    for (int i = 0; i < expandedCount; i++) {
+        push(expandedArgs[i]);
+    }
+    return invoke(name, expandedCount);
+}
+
+static bool collectExpandedKeywords(Value* kwSourceArgs, int kwSourceCount, ObjTuple* kwStarIndexes,
+                                    Value* explicitKwNames, int explicitKwCount,
+                                    Value* outKwNames, Value* outKwValues, int* outKwCount) {
+    int explicitCursor = 0;
+    int kwStarCursor = 0;
+
+    for (int i = 0; i < kwSourceCount; i++) {
+        bool isKwStar = false;
+        if (kwStarCursor < kwStarIndexes->items.count) {
+            Value marker = kwStarIndexes->items.values[kwStarCursor];
+            if (IS_NUMBER(marker) && (int)AS_NUMBER(marker) == i) {
+                isKwStar = true;
+                kwStarCursor++;
+            }
+        }
+
+        if (isKwStar) {
+            if (!IS_DICT(kwSourceArgs[i])) {
+                runtimeError("** argument must be a dict.");
+                return false;
+            }
+            ObjDict* dict = AS_DICT(kwSourceArgs[i]);
+            for (int j = 0; j < dict->table.capacity; j++) {
+                Entry* entry = &dict->table.entries[j];
+                if (IS_NIL(entry->key)) {
+                    continue;
+                }
+                if (!IS_STRING(entry->key)) {
+                    runtimeError("Keyword must be a string.");
+                    return false;
+                }
+                outKwNames[*outKwCount] = entry->key;
+                outKwValues[*outKwCount] = entry->value;
+                (*outKwCount)++;
+            }
+        } else {
+            if (explicitCursor >= explicitKwCount) {
+                runtimeError("Invalid expanded keyword argument state.");
+                return false;
+            }
+            outKwNames[*outKwCount] = explicitKwNames[explicitCursor++];
+            outKwValues[*outKwCount] = kwSourceArgs[i];
+            (*outKwCount)++;
+        }
+    }
+
+    return true;
+}
+
+static bool callValueExpandedKeyword(Value callee, int posCount, int kwSourceCount, int explicitKwCount,
+                                     ObjTuple* posStarIndexes, ObjTuple* kwStarIndexes) {
+    Value explicitKwNames[255];
+    for (int i = 0; i < explicitKwCount; i++) {
+        explicitKwNames[explicitKwCount - 1 - i] = pop();
+    }
+
+    Value kwSourceArgs[255];
+    for (int i = 0; i < kwSourceCount; i++) {
+        kwSourceArgs[kwSourceCount - 1 - i] = pop();
+    }
+
+    Value posSourceArgs[255];
+    for (int i = 0; i < posCount; i++) {
+        posSourceArgs[posCount - 1 - i] = pop();
+    }
+
+    pop();
+
+    Value expandedPosArgs[255];
+    int expandedPosCount = 0;
+    if (!collectExpandedArgs(posSourceArgs, posCount, posStarIndexes, expandedPosArgs, &expandedPosCount)) {
+        return false;
+    }
+
+    Value expandedKwNames[255];
+    Value expandedKwValues[255];
+    int expandedKwCount = 0;
+    if (!collectExpandedKeywords(kwSourceArgs, kwSourceCount, kwStarIndexes,
+                                 explicitKwNames, explicitKwCount,
+                                 expandedKwNames, expandedKwValues, &expandedKwCount)) {
+        return false;
+    }
+
+    push(callee);
+    for (int i = 0; i < expandedPosCount; i++) {
+        push(expandedPosArgs[i]);
+    }
+    for (int i = 0; i < expandedKwCount; i++) {
+        push(expandedKwValues[i]);
+    }
+    for (int i = 0; i < expandedKwCount; i++) {
+        push(expandedKwNames[i]);
+    }
+    return callValueKeyword(callee, expandedPosCount, expandedKwCount);
+}
+
+static bool invokeExpandedKeyword(ObjString* name, int posCount, int kwSourceCount, int explicitKwCount,
+                                  ObjTuple* posStarIndexes, ObjTuple* kwStarIndexes) {
+    Value explicitKwNames[255];
+    for (int i = 0; i < explicitKwCount; i++) {
+        explicitKwNames[explicitKwCount - 1 - i] = pop();
+    }
+
+    Value kwSourceArgs[255];
+    for (int i = 0; i < kwSourceCount; i++) {
+        kwSourceArgs[kwSourceCount - 1 - i] = pop();
+    }
+
+    Value posSourceArgs[255];
+    for (int i = 0; i < posCount; i++) {
+        posSourceArgs[posCount - 1 - i] = pop();
+    }
+
+    Value receiver = pop();
+
+    Value expandedPosArgs[255];
+    int expandedPosCount = 0;
+    if (!collectExpandedArgs(posSourceArgs, posCount, posStarIndexes, expandedPosArgs, &expandedPosCount)) {
+        return false;
+    }
+
+    Value expandedKwNames[255];
+    Value expandedKwValues[255];
+    int expandedKwCount = 0;
+    if (!collectExpandedKeywords(kwSourceArgs, kwSourceCount, kwStarIndexes,
+                                 explicitKwNames, explicitKwCount,
+                                 expandedKwNames, expandedKwValues, &expandedKwCount)) {
+        return false;
+    }
+
+    push(receiver);
+    for (int i = 0; i < expandedPosCount; i++) {
+        push(expandedPosArgs[i]);
+    }
+    for (int i = 0; i < expandedKwCount; i++) {
+        push(expandedKwValues[i]);
+    }
+    for (int i = 0; i < expandedKwCount; i++) {
+        push(expandedKwNames[i]);
+    }
+    return invokeKeyword(name, expandedPosCount, expandedKwCount);
+}
+
 static bool bindMethod(ObjClass* klass, ObjString* name) {
     Value method;
     if (!tableGet(&klass->methods, OBJ_VAL(name), &method)) {
@@ -2997,10 +3254,33 @@ static InterpretResult run() {
                 frame = &vm.frames[vm.frameCount - 1];
                 break;
             }
+            case OP_CALL_STAR: {
+                int argCount = READ_BYTE();
+                ObjTuple* starIndexes = AS_TUPLE(READ_CONSTANT());
+                if (!callValueExpanded(peek(argCount), argCount, starIndexes)) {
+                    HANDLE_RE();
+                }
+                frame = &vm.frames[vm.frameCount - 1];
+                break;
+            }
             case OP_CALL_KW: {
                 int posCount = READ_BYTE();
                 int kwCount = READ_BYTE();
                 if (!callValueKeyword(peek(posCount + 2 * kwCount), posCount, kwCount)) {
+                    HANDLE_RE();
+                }
+                frame = &vm.frames[vm.frameCount - 1];
+                break;
+            }
+            case OP_CALL_EX: {
+                int posCount = READ_BYTE();
+                int kwSourceCount = READ_BYTE();
+                int explicitKwCount = READ_BYTE();
+                ObjTuple* posStarIndexes = AS_TUPLE(READ_CONSTANT());
+                ObjTuple* kwStarIndexes = AS_TUPLE(READ_CONSTANT());
+                if (!callValueExpandedKeyword(peek(posCount + kwSourceCount + explicitKwCount),
+                                              posCount, kwSourceCount, explicitKwCount,
+                                              posStarIndexes, kwStarIndexes)) {
                     HANDLE_RE();
                 }
                 frame = &vm.frames[vm.frameCount - 1];
@@ -3015,11 +3295,35 @@ static InterpretResult run() {
                 frame = &vm.frames[vm.frameCount - 1];
                 break;
             }
+            case OP_INVOKE_STAR: {
+                ObjString* method = AS_STRING(READ_CONSTANT());
+                int argCount = READ_BYTE();
+                ObjTuple* starIndexes = AS_TUPLE(READ_CONSTANT());
+                if (!invokeExpanded(method, argCount, starIndexes)) {
+                    HANDLE_RE();
+                }
+                frame = &vm.frames[vm.frameCount - 1];
+                break;
+            }
             case OP_INVOKE_KW: {
                 ObjString* method = AS_STRING(READ_CONSTANT());
                 int posCount = READ_BYTE();
                 int kwCount = READ_BYTE();
                 if (!invokeKeyword(method, posCount, kwCount)) {
+                    HANDLE_RE();
+                }
+                frame = &vm.frames[vm.frameCount - 1];
+                break;
+            }
+            case OP_INVOKE_EX: {
+                ObjString* method = AS_STRING(READ_CONSTANT());
+                int posCount = READ_BYTE();
+                int kwSourceCount = READ_BYTE();
+                int explicitKwCount = READ_BYTE();
+                ObjTuple* posStarIndexes = AS_TUPLE(READ_CONSTANT());
+                ObjTuple* kwStarIndexes = AS_TUPLE(READ_CONSTANT());
+                if (!invokeExpandedKeyword(method, posCount, kwSourceCount, explicitKwCount,
+                                           posStarIndexes, kwStarIndexes)) {
                     HANDLE_RE();
                 }
                 frame = &vm.frames[vm.frameCount - 1];

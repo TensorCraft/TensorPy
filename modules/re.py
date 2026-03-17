@@ -199,6 +199,58 @@ def _parse_atom(pattern, i):
     return ({"type": "literal", "value": c}, i + 1)
 
 
+def _parse_quantifier(pattern, i, end_pi):
+    if i >= end_pi:
+        return (0, 1, i)
+
+    q = pattern[i]
+    if q == "*":
+        return (0, -1, i + 1)
+    if q == "+":
+        return (1, -1, i + 1)
+    if q == "?":
+        return (0, 1, i + 1)
+    if q != "{":
+        return (0, 1, i)
+
+    j = i + 1
+    min_count = 0
+    saw_min = False
+    while j < end_pi:
+        digit = "0123456789".find(pattern[j])
+        if digit == -1:
+            break
+        min_count = min_count * 10 + digit
+        j = j + 1
+        saw_min = True
+
+    if not saw_min:
+        return (0, 1, i)
+
+    max_count = min_count
+    if j < end_pi and pattern[j] == ",":
+        j = j + 1
+        if j < end_pi and pattern[j] == "}":
+            max_count = -1
+        else:
+            max_count = 0
+            saw_max = False
+            while j < end_pi:
+                digit = "0123456789".find(pattern[j])
+                if digit == -1:
+                    break
+                max_count = max_count * 10 + digit
+                j = j + 1
+                saw_max = True
+            if not saw_max:
+                return (0, 1, i)
+
+    if j >= end_pi or pattern[j] != "}":
+        return (0, 1, i)
+
+    return (min_count, max_count, j + 1)
+
+
 def _class_contains(atom, c):
     chars = atom["chars"]
     for item in chars:
@@ -292,33 +344,29 @@ def _match_sequence(pattern, pi, end_pi, text, ti, groups):
         atom = parsed[0]
         next_pi = parsed[1]
 
-    quant = ""
-    if next_pi < end_pi:
-        q = pattern[next_pi]
-        if q == "*" or q == "+" or q == "?":
-            quant = q
-            next_pi = next_pi + 1
+    quant = _parse_quantifier(pattern, next_pi, end_pi)
+    min_count = quant[0]
+    max_count = quant[1]
+    quant_end = quant[2]
 
-    if quant == "":
+    if quant_end == next_pi:
         single = _match_one(pattern, group_bounds, group_index, atom, text, ti, _copy_groups(groups))
         if not (single is None):
             return _match_sequence(pattern, next_pi, end_pi, text, single[0], single[1])
         return None
 
-    if quant == "?":
+    if min_count == 0 and max_count == 1:
         single = _match_one(pattern, group_bounds, group_index, atom, text, ti, _copy_groups(groups))
         if not (single is None):
-            result = _match_sequence(pattern, next_pi, end_pi, text, single[0], single[1])
+            result = _match_sequence(pattern, quant_end, end_pi, text, single[0], single[1])
             if not (result is None):
                 return result
-        return _match_sequence(pattern, next_pi, end_pi, text, ti, _copy_groups(groups))
-
-    min_count = 0
-    if quant == "+":
-        min_count = 1
+        return _match_sequence(pattern, quant_end, end_pi, text, ti, _copy_groups(groups))
 
     states = [(ti, _copy_groups(groups))]
     while True:
+        if max_count != -1 and len(states) - 1 >= max_count:
+            break
         current_state = states[len(states) - 1]
         next_state = _match_one(pattern, group_bounds, group_index, atom, text, current_state[0], current_state[1])
         if next_state is None or next_state[0] == current_state[0]:
@@ -331,7 +379,7 @@ def _match_sequence(pattern, pi, end_pi, text, ti, groups):
 
     idx = count
     while idx >= min_count:
-        result = _match_sequence(pattern, next_pi, end_pi, text, states[idx][0], _copy_groups(states[idx][1]))
+        result = _match_sequence(pattern, quant_end, end_pi, text, states[idx][0], _copy_groups(states[idx][1]))
         if not (result is None):
             return result
         idx = idx - 1
@@ -408,6 +456,23 @@ class Match:
             return (-1, -1)
         return bounds
 
+    def groups(self):
+        out = []
+        i = 1
+        while i < len(self._groups):
+            bounds = self._groups[i]
+            if bounds is None:
+                out.append(None)
+            else:
+                out.append(_slice_text(self.text, bounds[0], bounds[1]))
+            i = i + 1
+        result = []
+        i = 0
+        while i < len(out):
+            result.append(out[i])
+            i = i + 1
+        return result
+
 
 class Pattern:
 
@@ -439,7 +504,13 @@ class Pattern:
             result = _search_match(self.pattern, text, pos)
             if result is None:
                 break
-            out.append(_slice_text(text, result[0], result[1]))
+            match = Match(text, result[0], result[1], result[2])
+            if len(result[2]) == 1:
+                out.append(match.group())
+            elif len(result[2]) == 2:
+                out.append(match.group(1))
+            else:
+                out.append(match.groups())
             if result[1] == result[0]:
                 if result[1] >= len(text):
                     break

@@ -807,13 +807,56 @@ static void variable(bool canAssign) {
   namedVariable(parser.previous, canAssign);
 }
 
-static void argumentList(uint8_t *posCount, uint8_t *kwCount) {
+static uint8_t makeStarIndexConstant(uint8_t* starIndices, uint8_t starCount) {
+  ObjTuple* tuple = newTuple();
+  for (int i = 0; i < starCount; i++) {
+    writeValueArray(&tuple->items, NUMBER_VAL(starIndices[i]));
+  }
+  return makeConstant(OBJ_VAL(tuple));
+}
+
+static void argumentList(uint8_t *posCount, uint8_t *kwCount, uint8_t* kwSourceCount,
+                         bool* hasStar, uint8_t* starConst,
+                         bool* hasKwStar, uint8_t* kwStarConst) {
   *posCount = 0;
   *kwCount = 0;
+  *kwSourceCount = 0;
+  *hasStar = false;
+  *starConst = 0;
+  *hasKwStar = false;
+  *kwStarConst = 0;
   Value kwNames[255];
+  uint8_t starIndices[255];
+  uint8_t starCount = 0;
+  uint8_t kwStarIndices[255];
+  uint8_t kwStarCount = 0;
 
   if (parser.current.type != TOKEN_RIGHT_PAREN) {
     do {
+      if (match(TOKEN_STAR_STAR)) {
+        expression();
+        kwStarIndices[kwStarCount++] = *kwSourceCount;
+        (*kwSourceCount)++;
+        *hasKwStar = true;
+        if (*posCount + *kwSourceCount == 255) {
+          error("Can't have more than 255 arguments.");
+        }
+        continue;
+      }
+
+      if (match(TOKEN_STAR)) {
+        if (*kwCount > 0)
+          error("Positional argument cannot follow keyword argument.");
+        expression();
+        starIndices[starCount++] = *posCount;
+        (*posCount)++;
+        *hasStar = true;
+        if (*posCount + *kwCount == 255) {
+          error("Can't have more than 255 arguments.");
+        }
+        continue;
+      }
+
       bool isKw = false;
       if (parser.current.type == TOKEN_IDENTIFIER) {
         // Peek ahead for '='
@@ -831,6 +874,7 @@ static void argumentList(uint8_t *posCount, uint8_t *kwCount) {
         expression();
         kwNames[(*kwCount)++] =
             OBJ_VAL(copyString(nameToken.start, nameToken.length));
+        (*kwSourceCount)++;
       } else {
         if (*kwCount > 0)
           error("Positional argument cannot follow keyword argument.");
@@ -850,15 +894,31 @@ static void argumentList(uint8_t *posCount, uint8_t *kwCount) {
       emitConstant(kwNames[i]);
     }
   }
+  if (*hasStar) {
+    *starConst = makeStarIndexConstant(starIndices, starCount);
+  }
+  if (*hasKwStar) {
+    *kwStarConst = makeStarIndexConstant(kwStarIndices, kwStarCount);
+  }
 }
 
 static void call(bool canAssign) {
   (void)canAssign;
-  uint8_t posCount, kwCount;
-  argumentList(&posCount, &kwCount);
-  if (kwCount > 0) {
+  uint8_t posCount, kwCount, kwSourceCount, starConst, kwStarConst;
+  bool hasStar, hasKwStar;
+  argumentList(&posCount, &kwCount, &kwSourceCount, &hasStar, &starConst, &hasKwStar, &kwStarConst);
+  if (hasKwStar || (kwCount > 0 && hasStar)) {
+    emitBytes(OP_CALL_EX, posCount);
+    emitByte(kwSourceCount);
+    emitByte(kwCount);
+    emitByte(starConst);
+    emitByte(kwStarConst);
+  } else if (kwCount > 0) {
     emitBytes(OP_CALL_KW, posCount);
     emitByte(kwCount);
+  } else if (hasStar) {
+    emitBytes(OP_CALL_STAR, posCount);
+    emitByte(starConst);
   } else {
     emitBytes(OP_CALL, posCount);
   }
@@ -873,12 +933,24 @@ static void dot(bool canAssign) {
     expression();
     emitBytes(OP_SET_PROPERTY, name);
   } else if (match(TOKEN_LEFT_PAREN)) {
-    uint8_t posCount, kwCount;
-    argumentList(&posCount, &kwCount);
-    if (kwCount > 0) {
+    uint8_t posCount, kwCount, kwSourceCount, starConst, kwStarConst;
+    bool hasStar, hasKwStar;
+    argumentList(&posCount, &kwCount, &kwSourceCount, &hasStar, &starConst, &hasKwStar, &kwStarConst);
+    if (hasKwStar || (kwCount > 0 && hasStar)) {
+        emitBytes(OP_INVOKE_EX, name);
+        emitByte(posCount);
+        emitByte(kwSourceCount);
+        emitByte(kwCount);
+        emitByte(starConst);
+        emitByte(kwStarConst);
+    } else if (kwCount > 0) {
         emitBytes(OP_INVOKE_KW, name);
         emitByte(posCount);
         emitByte(kwCount);
+    } else if (hasStar) {
+        emitBytes(OP_INVOKE_STAR, name);
+        emitByte(posCount);
+        emitByte(starConst);
     } else {
         emitBytes(OP_INVOKE, name);
         emitByte(posCount);

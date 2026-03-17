@@ -40,3 +40,23 @@ print(collect(head=7))
 pack = lambda first, *items: (first, len(items))
 print(pack(10))
 print(pack(10, 20, 30))
+
+
+def show(a, b, c):
+    return (a, b, c)
+
+
+vals = [4, 5, 6]
+print(show(*vals))
+print(show(*[1], *[2, 3]))
+print(pack(*[7, 8, 9]))
+print(show(*"xyz"))
+
+
+def kwshow(a, b=0, c=0):
+    return (a, b, c)
+
+
+print(kwshow(**{"a": 1}))
+print(kwshow(1, **{"c": 3}))
+print(kwshow(*[1], **{"b": 2, "c": 4}))

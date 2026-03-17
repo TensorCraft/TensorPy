@@ -92,6 +92,8 @@ class JSON:
                     raise ValueError("Invalid escape sequence")
                 self.i = self.i + 1
             else:
+                if ord(c) < 32:
+                    raise ValueError("Invalid control character in string")
                 out = out + c
                 self.i = self.i + 1
 
@@ -105,13 +107,19 @@ class JSON:
 
         value = 0
         saw_digit = False
+        leading_zero = False
+        start_digits = self.i
         while self.i < len(self.s):
             c = self.s[self.i]
             digit = _digit_value(c)
             if digit != -1:
+                if not saw_digit and digit == 0:
+                    leading_zero = True
                 value = value * 10 + digit
                 self.i = self.i + 1
                 saw_digit = True
+                if leading_zero and self.i - start_digits > 1:
+                    raise ValueError("Invalid number")
             else:
                 break
 
@@ -266,10 +274,28 @@ def _escape_string(s):
             out = out + "\\b"
         elif c == "\f":
             out = out + "\\f"
+        elif ord(c) < 32 or ord(c) > 126:
+            out = out + _unicode_escape(ord(c))
         else:
             out = out + c
         i = i + 1
     return out
+
+
+def _hex_digit(n):
+    digits = "0123456789abcdef"
+    return digits[n]
+
+
+def _unicode_escape(n):
+    n3 = n % 16
+    n = n // 16
+    n2 = n % 16
+    n = n // 16
+    n1 = n % 16
+    n = n // 16
+    n0 = n % 16
+    return "\\u" + _hex_digit(n0) + _hex_digit(n1) + _hex_digit(n2) + _hex_digit(n3)
 
 
 def dumps(value):

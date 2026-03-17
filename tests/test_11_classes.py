@@ -58,3 +58,13 @@ c = Collector()
 print(c.gather(1))
 print(c.gather(1, 2, 3))
 print(c.gather(head=4))
+print(c.gather(*[7, 8, 9]))
+
+
+class KeywordCollector:
+    def gather(self, a, b=0, c=0):
+        return (a, b, c)
+
+
+kc = KeywordCollector()
+print(kc.gather(**{"a": 5, "c": 7}))
