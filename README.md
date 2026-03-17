@@ -95,6 +95,9 @@ The `json` module supports:
 - `json.loads(...)`
 - `json.dumps(...)`
 - `json.JSON(...).parse()`
+- string escapes including `\n`, `\t`, `\r`, `\b`, `\f`, and `\uXXXX`
+- exponent numbers like `1.5e2`
+- stricter invalid-literal and invalid-escape errors
 
 The `re` module currently supports a useful regex subset:
 
@@ -114,10 +117,12 @@ Supported regex constructs currently include:
 - `^` and `$`
 - top-level alternation with `|`
 - `*`, `+`, `?`
+- grouping, including grouped quantifiers like `(ab)+`
 - character classes like `[abc]`
 - ranges like `[a-z]`
 - negated classes like `[^0-9]`
 - `\d`, `\w`, `\s`
+- captured-group access via `group(1)`, `start(1)`, `end(1)`, and `span(1)`
 
 ## Build
 

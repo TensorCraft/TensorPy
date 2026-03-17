@@ -11,6 +11,10 @@ print(jl("[1,2,3]")[2])
 from json import JSON
 parser = JSON("{\"x\":5}")
 print(parser.parse()["x"])
+print(json.loads("{\"n\":1.5e2,\"s\":\"line\\ntext\",\"u\":\"\\u0041\"}")["n"])
+print(json.loads("{\"n\":1.5e2,\"s\":\"line\\ntext\",\"u\":\"\\u0041\"}")["s"])
+print(json.loads("{\"n\":1.5e2,\"s\":\"line\\ntext\",\"u\":\"\\u0041\"}")["u"])
+print(json.dumps({"ctrl": "a\b\f"}))
 
 try:
     json.loads("{\"a\": 1} trailing")
@@ -19,5 +23,15 @@ except ValueError as e:
 
 try:
     json.loads("[1 2]")
+except ValueError as e:
+    print(e.message)
+
+try:
+    json.loads("\"\\x\"")
+except ValueError as e:
+    print(e.message)
+
+try:
+    json.loads("tru")
 except ValueError as e:
     print(e.message)

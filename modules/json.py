@@ -33,15 +33,23 @@ class JSON:
         if c == "\"":
             return self.string()
         if c == "t":
-            self.i = self.i + 4
+            self.expect("true")
             return True
         if c == "f":
-            self.i = self.i + 5
+            self.expect("false")
             return False
         if c == "n":
-            self.i = self.i + 4
+            self.expect("null")
             return None
         return self.number()
+
+    def expect(self, token):
+        j = 0
+        while j < len(token):
+            if self.i + j >= len(self.s) or self.s[self.i + j] != token[j]:
+                raise ValueError("Invalid literal")
+            j = j + 1
+        self.i = self.i + len(token)
 
     def string(self):
         self.i = self.i + 1
@@ -54,6 +62,8 @@ class JSON:
                 return out
             if c == "\\":
                 self.i = self.i + 1
+                if self.i >= len(self.s):
+                    raise ValueError("Unterminated escape sequence")
                 esc = self.s[self.i]
                 if esc == "n":
                     out = out + "\n"
@@ -61,14 +71,31 @@ class JSON:
                     out = out + "\t"
                 elif esc == "r":
                     out = out + "\r"
-                else:
+                elif esc == "b":
+                    out = out + "\b"
+                elif esc == "f":
+                    out = out + "\f"
+                elif esc == "\"" or esc == "\\" or esc == "/":
                     out = out + esc
+                elif esc == "u":
+                    if self.i + 4 >= len(self.s):
+                        raise ValueError("Invalid unicode escape")
+                    code = _hex_value(self.s[self.i + 1])
+                    code = code * 16 + _hex_value(self.s[self.i + 2])
+                    code = code * 16 + _hex_value(self.s[self.i + 3])
+                    code = code * 16 + _hex_value(self.s[self.i + 4])
+                    if code < 0:
+                        raise ValueError("Invalid unicode escape")
+                    out = out + chr(code)
+                    self.i = self.i + 4
+                else:
+                    raise ValueError("Invalid escape sequence")
                 self.i = self.i + 1
             else:
                 out = out + c
                 self.i = self.i + 1
 
-        return out
+        raise ValueError("Unterminated string")
 
     def number(self):
         sign = 1
@@ -107,6 +134,42 @@ class JSON:
                     break
             if not saw_fraction:
                 raise ValueError("Invalid number")
+
+        if self.i < len(self.s):
+            c = self.s[self.i]
+            if c == "e" or c == "E":
+                self.i = self.i + 1
+                exp_sign = 1
+                if self.i < len(self.s):
+                    if self.s[self.i] == "-":
+                        exp_sign = -1
+                        self.i = self.i + 1
+                    elif self.s[self.i] == "+":
+                        self.i = self.i + 1
+
+                exponent = 0
+                saw_exponent = False
+                while self.i < len(self.s):
+                    digit = _digit_value(self.s[self.i])
+                    if digit == -1:
+                        break
+                    exponent = exponent * 10 + digit
+                    self.i = self.i + 1
+                    saw_exponent = True
+
+                if not saw_exponent:
+                    raise ValueError("Invalid number")
+
+                power = 1
+                j = 0
+                while j < exponent:
+                    power = power * 10
+                    j = j + 1
+
+                if exp_sign < 0:
+                    value = value / power
+                else:
+                    value = value * power
 
         return value * sign
 
@@ -174,6 +237,16 @@ def _digit_value(c):
     return digits.find(c)
 
 
+def _hex_value(c):
+    digits = "0123456789abcdefABCDEF"
+    idx = digits.find(c)
+    if idx == -1:
+        return -1
+    if idx < 16:
+        return idx
+    return idx - 6
+
+
 def _escape_string(s):
     out = ""
     i = 0
@@ -189,6 +262,10 @@ def _escape_string(s):
             out = out + "\\t"
         elif c == "\r":
             out = out + "\\r"
+        elif c == "\b":
+            out = out + "\\b"
+        elif c == "\f":
+            out = out + "\\f"
         else:
             out = out + c
         i = i + 1

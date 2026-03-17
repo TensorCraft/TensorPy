@@ -47,6 +47,64 @@ def _slice_text(text, start, end):
     return out
 
 
+def _copy_groups(groups):
+    out = []
+    i = 0
+    while i < len(groups):
+        out.append(groups[i])
+        i = i + 1
+    return out
+
+
+def _blank_groups(count):
+    out = []
+    i = 0
+    while i <= count:
+        out.append(None)
+        i = i + 1
+    return out
+
+
+def _count_groups(pattern):
+    count = 0
+    in_class = False
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            i = i + 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]":
+            in_class = False
+        elif not in_class and c == "(":
+            count = count + 1
+        i = i + 1
+    return count
+
+
+def _group_index(pattern, group_start):
+    count = 0
+    in_class = False
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            i = i + 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]":
+            in_class = False
+        elif not in_class and c == "(":
+            count = count + 1
+            if i == group_start:
+                return count
+        i = i + 1
+    return -1
+
+
 def _find_group_end(pattern, start):
     depth = 1
     i = start
@@ -183,34 +241,51 @@ def _atom_matches(atom, c):
     return False
 
 
-def _match_pattern_range(pattern, start, end, text, ti):
+def _match_one(pattern, group_bounds, group_index, atom, text, current_ti, current_groups):
+    if not (group_bounds is None):
+        inner_groups = _copy_groups(current_groups)
+        result = _match_pattern_range(pattern, group_bounds[0], group_bounds[1], text, current_ti, inner_groups)
+        if result is None:
+            return None
+        group_end_ti = result[0]
+        result_groups = result[1]
+        result_groups[group_index] = (current_ti, group_end_ti)
+        return (group_end_ti, result_groups)
+    if current_ti < len(text) and _atom_matches(atom, text[current_ti]):
+        return (current_ti + 1, current_groups)
+    return None
+
+
+def _match_pattern_range(pattern, start, end, text, ti, groups):
     parts = _split_alternatives(pattern, start, end)
     if len(parts) == 1:
-        return _match_sequence(pattern, start, end, text, ti)
+        return _match_sequence(pattern, start, end, text, ti, groups)
 
     for part in parts:
-        result = _match_sequence(pattern, part[0], part[1], text, ti)
-        if result != -1:
+        result = _match_sequence(pattern, part[0], part[1], text, ti, _copy_groups(groups))
+        if not (result is None):
             return result
-    return -1
+    return None
 
 
-def _match_sequence(pattern, pi, end_pi, text, ti):
+def _match_sequence(pattern, pi, end_pi, text, ti, groups):
     if pi >= end_pi:
-        return ti
+        return (ti, groups)
 
     if pattern[pi] == "$" and pi + 1 == end_pi:
         if ti == len(text):
-            return ti
-        return -1
+            return (ti, groups)
+        return None
 
     atom = None
     group_bounds = None
+    group_index = -1
     if pattern[pi] == "(":
         group_end = _find_group_end(pattern, pi + 1)
-        if group_end == -1:
-            return -1
+        if group_end == -1 or group_end >= end_pi:
+            return None
         group_bounds = (pi + 1, group_end)
+        group_index = _group_index(pattern, pi)
         next_pi = group_end + 1
     else:
         parsed = _parse_atom(pattern, pi)
@@ -224,65 +299,50 @@ def _match_sequence(pattern, pi, end_pi, text, ti):
             quant = q
             next_pi = next_pi + 1
 
-    if group_bounds is not None and quant != "":
-        return -1
-
-    def _match_one(current_ti):
-        if group_bounds is not None:
-            return _match_pattern_range(pattern, group_bounds[0], group_bounds[1], text, current_ti)
-        if current_ti < len(text) and _atom_matches(atom, text[current_ti]):
-            return current_ti + 1
-        return -1
-
     if quant == "":
-        single_end = _match_one(ti)
-        if single_end != -1:
-            return _match_sequence(pattern, next_pi, end_pi, text, single_end)
-        return -1
+        single = _match_one(pattern, group_bounds, group_index, atom, text, ti, _copy_groups(groups))
+        if not (single is None):
+            return _match_sequence(pattern, next_pi, end_pi, text, single[0], single[1])
+        return None
 
     if quant == "?":
-        single_end = _match_one(ti)
-        if single_end != -1:
-            end = _match_sequence(pattern, next_pi, end_pi, text, single_end)
-            if end != -1:
-                return end
-        return _match_sequence(pattern, next_pi, end_pi, text, ti)
+        single = _match_one(pattern, group_bounds, group_index, atom, text, ti, _copy_groups(groups))
+        if not (single is None):
+            result = _match_sequence(pattern, next_pi, end_pi, text, single[0], single[1])
+            if not (result is None):
+                return result
+        return _match_sequence(pattern, next_pi, end_pi, text, ti, _copy_groups(groups))
 
     min_count = 0
     if quant == "+":
         min_count = 1
 
-    cur = ti
-    count = 0
+    states = [(ti, _copy_groups(groups))]
     while True:
-        next_cur = _match_one(cur)
-        if next_cur == -1 or next_cur == cur:
+        current_state = states[len(states) - 1]
+        next_state = _match_one(pattern, group_bounds, group_index, atom, text, current_state[0], current_state[1])
+        if next_state is None or next_state[0] == current_state[0]:
             break
-        cur = next_cur
-        count = count + 1
+        states.append(next_state)
 
+    count = len(states) - 1
     if count < min_count:
-        return -1
-
-    min_positions = [ti]
-    cur = ti
-    while len(min_positions) <= count:
-        cur = _match_one(cur)
-        min_positions.append(cur)
+        return None
 
     idx = count
     while idx >= min_count:
-        end = _match_sequence(pattern, next_pi, end_pi, text, min_positions[idx])
-        if end != -1:
-            return end
+        result = _match_sequence(pattern, next_pi, end_pi, text, states[idx][0], _copy_groups(states[idx][1]))
+        if not (result is None):
+            return result
         idx = idx - 1
 
-    return -1
+    return None
 
 
-def _search_bounds(pattern, text, start_pos):
+def _search_match(pattern, text, start_pos):
     pi = 0
     anchored = False
+    group_count = _count_groups(pattern)
     if len(pattern) > 0 and pattern[0] == "^":
         anchored = True
         pi = 1
@@ -290,40 +350,63 @@ def _search_bounds(pattern, text, start_pos):
     if anchored:
         if start_pos != 0:
             return None
-        end = _match_pattern_range(pattern, pi, len(pattern), text, 0)
-        if end == -1:
+        result = _match_pattern_range(pattern, pi, len(pattern), text, 0, _blank_groups(group_count))
+        if result is None:
             return None
-        return (0, end)
+        groups = result[1]
+        groups[0] = (0, result[0])
+        return (0, result[0], groups)
 
     pos = start_pos
     while pos <= len(text):
-        end = _match_pattern_range(pattern, pi, len(pattern), text, pos)
-        if end != -1:
-            return (pos, end)
+        result = _match_pattern_range(pattern, pi, len(pattern), text, pos, _blank_groups(group_count))
+        if not (result is None):
+            groups = result[1]
+            groups[0] = (pos, result[0])
+            return (pos, result[0], groups)
         pos = pos + 1
     return None
 
 
 class Match:
 
-    def __init__(self, text, start, end):
+    def __init__(self, text, start, end, groups):
         self.text = text
         self._start = start
         self._end = end
+        self._groups = groups
 
     def group(self, index=0):
-        if index != 0:
+        if index < 0 or index >= len(self._groups):
             raise ValueError
-        return _slice_text(self.text, self._start, self._end)
+        bounds = self._groups[index]
+        if bounds is None:
+            return None
+        return _slice_text(self.text, bounds[0], bounds[1])
 
-    def start(self):
-        return self._start
+    def start(self, index=0):
+        if index < 0 or index >= len(self._groups):
+            raise ValueError
+        bounds = self._groups[index]
+        if bounds is None:
+            return -1
+        return bounds[0]
 
-    def end(self):
-        return self._end
+    def end(self, index=0):
+        if index < 0 or index >= len(self._groups):
+            raise ValueError
+        bounds = self._groups[index]
+        if bounds is None:
+            return -1
+        return bounds[1]
 
-    def span(self):
-        return (self._start, self._end)
+    def span(self, index=0):
+        if index < 0 or index >= len(self._groups):
+            raise ValueError
+        bounds = self._groups[index]
+        if bounds is None:
+            return (-1, -1)
+        return bounds
 
 
 class Pattern:
@@ -332,37 +415,37 @@ class Pattern:
         self.pattern = pattern
 
     def match(self, text):
-        bounds = _search_bounds(self.pattern, text, 0)
-        if bounds is None or bounds[0] != 0:
+        result = _search_match(self.pattern, text, 0)
+        if result is None or result[0] != 0:
             return None
-        return Match(text, bounds[0], bounds[1])
+        return Match(text, result[0], result[1], result[2])
 
     def search(self, text):
-        bounds = _search_bounds(self.pattern, text, 0)
-        if bounds is None:
+        result = _search_match(self.pattern, text, 0)
+        if result is None:
             return None
-        return Match(text, bounds[0], bounds[1])
+        return Match(text, result[0], result[1], result[2])
 
     def fullmatch(self, text):
-        bounds = _search_bounds(self.pattern, text, 0)
-        if bounds is None or bounds[0] != 0 or bounds[1] != len(text):
+        result = _search_match(self.pattern, text, 0)
+        if result is None or result[0] != 0 or result[1] != len(text):
             return None
-        return Match(text, bounds[0], bounds[1])
+        return Match(text, result[0], result[1], result[2])
 
     def findall(self, text):
         out = []
         pos = 0
         while pos <= len(text):
-            bounds = _search_bounds(self.pattern, text, pos)
-            if bounds is None:
+            result = _search_match(self.pattern, text, pos)
+            if result is None:
                 break
-            out.append(_slice_text(text, bounds[0], bounds[1]))
-            if bounds[1] == bounds[0]:
-                if bounds[1] >= len(text):
+            out.append(_slice_text(text, result[0], result[1]))
+            if result[1] == result[0]:
+                if result[1] >= len(text):
                     break
-                pos = bounds[1] + 1
+                pos = result[1] + 1
             else:
-                pos = bounds[1]
+                pos = result[1]
         return out
 
     def split(self, text, maxsplit=0):
@@ -372,18 +455,18 @@ class Pattern:
         while pos <= len(text):
             if maxsplit != 0 and splits >= maxsplit:
                 break
-            bounds = _search_bounds(self.pattern, text, pos)
-            if bounds is None:
+            result = _search_match(self.pattern, text, pos)
+            if result is None:
                 break
-            out.append(_slice_text(text, pos, bounds[0]))
+            out.append(_slice_text(text, pos, result[0]))
             splits = splits + 1
-            if bounds[1] == bounds[0]:
-                if bounds[1] >= len(text):
-                    pos = bounds[1]
+            if result[1] == result[0]:
+                if result[1] >= len(text):
+                    pos = result[1]
                     break
-                pos = bounds[1] + 1
+                pos = result[1] + 1
             else:
-                pos = bounds[1]
+                pos = result[1]
         out.append(_slice_text(text, pos, len(text)))
         return out
 
@@ -397,19 +480,19 @@ class Pattern:
         while pos <= len(text):
             if count != 0 and replaced >= count:
                 break
-            bounds = _search_bounds(self.pattern, text, pos)
-            if bounds is None:
+            result = _search_match(self.pattern, text, pos)
+            if result is None:
                 break
-            out = out + _slice_text(text, pos, bounds[0]) + repl
+            out = out + _slice_text(text, pos, result[0]) + repl
             replaced = replaced + 1
-            if bounds[1] == bounds[0]:
-                if bounds[1] >= len(text):
-                    pos = bounds[1]
+            if result[1] == result[0]:
+                if result[1] >= len(text):
+                    pos = result[1]
                     break
-                out = out + _slice_text(text, bounds[1], bounds[1] + 1)
-                pos = bounds[1] + 1
+                out = out + _slice_text(text, result[1], result[1] + 1)
+                pos = result[1] + 1
             else:
-                pos = bounds[1]
+                pos = result[1]
         out = out + _slice_text(text, pos, len(text))
         return (out, replaced)
 

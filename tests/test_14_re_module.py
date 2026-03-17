@@ -25,3 +25,17 @@ print(re.search("\\s+", "a \t b").group())
 print(re.match("colou?r", "color").group())
 print(re.match("colou?r", "colour").group())
 print(re.fullmatch("cat|dog", "dog").group())
+
+g1 = re.fullmatch("(ab)+", "abab")
+print(g1.group())
+print(g1.group(1))
+print(g1.span(1))
+
+g2 = re.fullmatch("([a-z]+)(\\d+)", "tensor42")
+print(g2.group(1))
+print(g2.group(2))
+print(g2.start(2))
+print(g2.end(2))
+
+g3 = re.fullmatch("a(bc)?d", "ad")
+print(g3.group(1) is None)
