@@ -9,6 +9,7 @@
 #endif
 
 #include "tensorpy/compute.h"
+#include "tensorpy/memory.h"
 
 typedef struct {
     float* out;
@@ -455,7 +456,7 @@ bool tpComputeSumF32(TPComputeContext* context,
         int grain = tpThreadedGrainSize(context, count);
         int chunkCount = (count + grain - 1) / grain;
         TPReduceTask task;
-        float* partials = (float*)calloc((size_t)chunkCount, sizeof(float));
+        float* partials = (float*)tpMemCalloc((size_t)chunkCount, sizeof(float));
         int i;
 
         if (partials == NULL) {
@@ -467,7 +468,7 @@ bool tpComputeSumF32(TPComputeContext* context,
         task.baseStart = 0;
         task.grainSize = grain;
         if (!platformThreadPoolParallelFor(context->pool, 0, count, grain, tpSumRangeTask, &task)) {
-            free(partials);
+            tpMemFree(partials);
             return false;
         }
 
@@ -475,7 +476,7 @@ bool tpComputeSumF32(TPComputeContext* context,
         for (i = 0; i < chunkCount; i++) {
             *out += partials[i];
         }
-        free(partials);
+        tpMemFree(partials);
         return true;
     }
 
@@ -512,7 +513,7 @@ bool tpComputeDotF32(TPComputeContext* context,
         int grain = tpThreadedGrainSize(context, count);
         int chunkCount = (count + grain - 1) / grain;
         TPReduceTask task;
-        float* partials = (float*)calloc((size_t)chunkCount, sizeof(float));
+        float* partials = (float*)tpMemCalloc((size_t)chunkCount, sizeof(float));
         int i;
 
         if (partials == NULL) {
@@ -525,7 +526,7 @@ bool tpComputeDotF32(TPComputeContext* context,
         task.baseStart = 0;
         task.grainSize = grain;
         if (!platformThreadPoolParallelFor(context->pool, 0, count, grain, tpDotRangeTask, &task)) {
-            free(partials);
+            tpMemFree(partials);
             return false;
         }
 
@@ -533,7 +534,7 @@ bool tpComputeDotF32(TPComputeContext* context,
         for (i = 0; i < chunkCount; i++) {
             *out += partials[i];
         }
-        free(partials);
+        tpMemFree(partials);
         return true;
     }
 

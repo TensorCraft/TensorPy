@@ -10,6 +10,7 @@
 #include "tensorpy/builtins.h"
 #include "tensorpy/compiler.h"
 #include "tensorpy/debug.h"
+#include "tensorpy/memory.h"
 #include "tensorpy/object.h"
 #include "tensorpy/platform.h"
 #include "tensorpy/scanner.h"
@@ -51,7 +52,7 @@ static char* readFileToBuffer(const char* path) {
 
 static char* moduleNameToPath(const char* moduleName) {
     size_t length = strlen(moduleName);
-    char* path = (char*)malloc(length + 1);
+    char* path = (char*)tpMemAlloc(length + 1);
     for (size_t i = 0; i < length; i++) {
         path[i] = moduleName[i] == '.' ? '/' : moduleName[i];
     }
@@ -64,33 +65,33 @@ static char* readModuleFile(const char* moduleName) {
     const char* roots[] = {"modules", "lib", "."};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         size_t pathLen = strlen(roots[i]) + 1 + strlen(normalized) + 3;
-        char* path = (char*)malloc(pathLen + 1);
+        char* path = (char*)tpMemAlloc(pathLen + 1);
         snprintf(path, pathLen + 1, "%s/%s.py", roots[i], normalized);
 
         char* source = readFileToBuffer(path);
-        free(path);
+        tpMemFree(path);
         if (source != NULL) {
-            free(normalized);
+            tpMemFree(normalized);
             return source;
         }
 
         pathLen = strlen(roots[i]) + 1 + strlen(normalized) + 12;
-        path = (char*)malloc(pathLen + 1);
+        path = (char*)tpMemAlloc(pathLen + 1);
         snprintf(path, pathLen + 1, "%s/%s/__init__.py", roots[i], normalized);
         source = readFileToBuffer(path);
-        free(path);
+        tpMemFree(path);
         if (source != NULL) {
-            free(normalized);
+            tpMemFree(normalized);
             return source;
         }
     }
 
     size_t fallbackLen = strlen(normalized) + 3;
-    char* fallback = (char*)malloc(fallbackLen + 1);
+    char* fallback = (char*)tpMemAlloc(fallbackLen + 1);
     snprintf(fallback, fallbackLen + 1, "%s.py", normalized);
     char* source = readFileToBuffer(fallback);
-    free(fallback);
-    free(normalized);
+    tpMemFree(fallback);
+    tpMemFree(normalized);
     return source;
 }
 
@@ -119,7 +120,7 @@ static bool tryImportModuleProperty(ObjInstance* instance, ObjString* name, Valu
 
     ObjString* moduleName = AS_STRING(moduleNameValue);
     int fullLength = moduleName->length + 1 + name->length;
-    char* fullName = (char*)malloc((size_t)fullLength + 1);
+    char* fullName = (char*)tpMemAlloc((size_t)fullLength + 1);
     snprintf(fullName, (size_t)fullLength + 1, "%s.%s", moduleName->chars, name->chars);
     ObjString* fullModuleName = takeString(fullName, fullLength);
     *value = importModuleValue(fullModuleName);
@@ -2857,7 +2858,7 @@ static Value importModuleValue(ObjString* moduleName) {
 
     ObjEnvironment* moduleEnv = newEnvironmentWithTable(vm.globalEnv, &module->fields);
     InterpretResult result = interpretInGlobals(source, moduleName->chars, moduleEnv);
-    free(source);
+    tpMemFree(source);
     if (result != INTERPRET_OK) {
         tableDelete(&vm.modules, OBJ_VAL(moduleName));
         return NIL_VAL;

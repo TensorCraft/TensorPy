@@ -6,10 +6,17 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#include "tensorpy/memory.h"
 #include "tensorpy/platform.h"
+
+typedef pthread_t PlatformThreadHandle;
+typedef pthread_mutex_t PlatformMutexHandle;
+typedef pthread_cond_t PlatformCondVarHandle;
+typedef atomic_int_fast64_t PlatformAtomicHandle;
 
 typedef struct PlatformTaskState {
     PlatformAtomicInt refCount;
@@ -53,22 +60,24 @@ typedef struct {
     int end;
 } PlatformParallelForTask;
 
-static char* duplicateString(const char* source) {
-    size_t length;
-    char* copy;
+static PlatformThreadHandle* platformThreadHandle(PlatformThread* thread) {
+    return (PlatformThreadHandle*)thread->impl;
+}
 
-    if (source == NULL) {
-        return NULL;
-    }
+static PlatformMutexHandle* platformMutexHandle(PlatformMutex* mutex) {
+    return (PlatformMutexHandle*)mutex->impl;
+}
 
-    length = strlen(source);
-    copy = (char*)malloc(length + 1);
-    if (copy == NULL) {
-        return NULL;
-    }
+static PlatformCondVarHandle* platformCondHandle(PlatformCondVar* cond) {
+    return (PlatformCondVarHandle*)cond->impl;
+}
 
-    memcpy(copy, source, length + 1);
-    return copy;
+static PlatformAtomicHandle* platformAtomicHandle(PlatformAtomicInt* value) {
+    return (PlatformAtomicHandle*)value->impl;
+}
+
+static const PlatformAtomicHandle* platformAtomicHandleConst(const PlatformAtomicInt* value) {
+    return (const PlatformAtomicHandle*)value->impl;
 }
 
 static void platformWriteLastError(PlatformThreadPool* pool, const char* message) {
@@ -93,7 +102,7 @@ static bool platformTaskStateCreate(PlatformTaskState** outState) {
         return false;
     }
 
-    state = (PlatformTaskState*)malloc(sizeof(PlatformTaskState));
+    state = (PlatformTaskState*)tpMemAlloc(sizeof(PlatformTaskState));
     if (state == NULL) {
         return false;
     }
@@ -103,7 +112,7 @@ static bool platformTaskStateCreate(PlatformTaskState** outState) {
     if (!platformMutexInit(&state->mutex) || !platformCondVarInit(&state->cond)) {
         platformCondVarDestroy(&state->cond);
         platformMutexDestroy(&state->mutex);
-        free(state);
+        tpMemFree(state);
         return false;
     }
 
@@ -125,7 +134,7 @@ static void platformTaskStateRelease(PlatformTaskState* state) {
     if (platformAtomicFetchSub(&state->refCount, 1) == 1) {
         platformCondVarDestroy(&state->cond);
         platformMutexDestroy(&state->mutex);
-        free(state);
+        tpMemFree(state);
     }
 }
 
@@ -162,7 +171,7 @@ static bool platformThreadPoolQueueGrow(PlatformThreadPool* pool) {
     }
 
     newCapacity = pool->queueCapacity < 16 ? 16 : pool->queueCapacity * 2;
-    grown = (PlatformQueuedTask*)malloc(sizeof(PlatformQueuedTask) * newCapacity);
+    grown = (PlatformQueuedTask*)tpMemAlloc(sizeof(PlatformQueuedTask) * (size_t)newCapacity);
     if (grown == NULL) {
         platformWriteLastError(pool, "failed to grow task queue");
         return false;
@@ -172,7 +181,7 @@ static bool platformThreadPoolQueueGrow(PlatformThreadPool* pool) {
         grown[i] = pool->queue[(pool->queueHead + i) % pool->queueCapacity];
     }
 
-    free(pool->queue);
+    tpMemFree(pool->queue);
     pool->queue = grown;
     pool->queueCapacity = newCapacity;
     pool->queueHead = 0;
@@ -249,7 +258,7 @@ static void platformParallelForRunRange(void* context) {
     if (platformAtomicFetchSub(&task->state->remaining, 1) == 1) {
         platformEventSignal(&task->state->done);
     }
-    free(task);
+    tpMemFree(task);
 }
 
 char* platformReadTextFile(const char* path) {
@@ -262,7 +271,7 @@ char* platformReadTextFile(const char* path) {
     size_t fileSize = ftell(file);
     rewind(file);
 
-    char* buffer = (char*)malloc(fileSize + 1);
+    char* buffer = (char*)tpMemAlloc(fileSize + 1);
     if (buffer == NULL) {
         fclose(file);
         return NULL;
@@ -271,7 +280,7 @@ char* platformReadTextFile(const char* path) {
     size_t bytesRead = fread(buffer, sizeof(char), fileSize, file);
     fclose(file);
     if (bytesRead < fileSize) {
-        free(buffer);
+        tpMemFree(buffer);
         return NULL;
     }
 
@@ -306,7 +315,7 @@ uint8_t* platformReadBinaryFile(const char* path, int* count) {
     }
     rewind(file);
 
-    buffer = (uint8_t*)malloc((size_t)fileSize);
+    buffer = (uint8_t*)tpMemAlloc((size_t)fileSize);
     if (buffer == NULL && fileSize > 0) {
         fclose(file);
         return NULL;
@@ -315,7 +324,7 @@ uint8_t* platformReadBinaryFile(const char* path, int* count) {
     bytesRead = fread(buffer, sizeof(uint8_t), (size_t)fileSize, file);
     fclose(file);
     if (bytesRead < (size_t)fileSize) {
-        free(buffer);
+        tpMemFree(buffer);
         return NULL;
     }
 
@@ -373,7 +382,7 @@ char* platformGetEnvironmentVariable(const char* name) {
         return NULL;
     }
 
-    return duplicateString(value);
+    return tpMemDup(value);
 }
 
 int platformSystemCommand(const char* command) {
@@ -411,7 +420,7 @@ double platformRandomDouble(void) {
 char* platformGetCurrentDirectory(void) {
     size_t size = 256;
     for (;;) {
-        char* buffer = (char*)malloc(size);
+        char* buffer = (char*)tpMemAlloc(size);
         if (buffer == NULL) {
             return NULL;
         }
@@ -420,7 +429,7 @@ char* platformGetCurrentDirectory(void) {
             return buffer;
         }
 
-        free(buffer);
+        tpMemFree(buffer);
         size *= 2;
         if (size > 16384) {
             return NULL;
@@ -444,7 +453,7 @@ char** platformListDirectory(const char* path, int* count) {
         return NULL;
     }
 
-    entries = (char**)malloc(sizeof(char*) * capacity);
+    entries = (char**)tpMemAlloc(sizeof(char*) * (size_t)capacity);
     if (entries == NULL) {
         closedir(dir);
         return NULL;
@@ -461,7 +470,7 @@ char** platformListDirectory(const char* path, int* count) {
         if (entryCount == capacity) {
             char** grown;
             capacity *= 2;
-            grown = (char**)realloc(entries, sizeof(char*) * capacity);
+            grown = (char**)tpMemRealloc(entries, sizeof(char*) * (size_t)capacity);
             if (grown == NULL) {
                 platformFreeDirectoryList(entries, entryCount);
                 closedir(dir);
@@ -471,7 +480,7 @@ char** platformListDirectory(const char* path, int* count) {
         }
 
         length = strlen(entry->d_name);
-        copy = (char*)malloc(length + 1);
+        copy = (char*)tpMemAlloc(length + 1);
         if (copy == NULL) {
             platformFreeDirectoryList(entries, entryCount);
             closedir(dir);
@@ -494,9 +503,9 @@ void platformFreeDirectoryList(char** entries, int count) {
     }
 
     for (i = 0; i < count; i++) {
-        free(entries[i]);
+        tpMemFree(entries[i]);
     }
-    free(entries);
+    tpMemFree(entries);
 }
 
 static bool platformStatPath(const char* path, struct stat* out) {
@@ -540,7 +549,7 @@ bool platformCreateDirectories(const char* path) {
     }
 
     length = strlen(path);
-    copy = (char*)malloc(length + 1);
+    copy = (char*)tpMemAlloc(length + 1);
     if (copy == NULL) {
         return false;
     }
@@ -553,18 +562,18 @@ bool platformCreateDirectories(const char* path) {
 
         copy[i] = '\0';
         if (copy[0] != '\0' && !platformPathIsDirectory(copy) && mkdir(copy, 0777) != 0) {
-            free(copy);
+            tpMemFree(copy);
             return false;
         }
         copy[i] = '/';
     }
 
     if (!platformPathIsDirectory(copy) && mkdir(copy, 0777) != 0) {
-        free(copy);
+        tpMemFree(copy);
         return false;
     }
 
-    free(copy);
+    tpMemFree(copy);
     return true;
 }
 
@@ -610,12 +619,22 @@ int platformHardwareThreadCount(void) {
 bool platformThreadCreate(PlatformThread* thread,
                           PlatformThreadFunction function,
                           void* context) {
+    PlatformThreadHandle* handle;
+
     if (thread == NULL || function == NULL) {
         return false;
     }
 
+    handle = (PlatformThreadHandle*)tpMemAlloc(sizeof(PlatformThreadHandle));
+    if (handle == NULL) {
+        return false;
+    }
+
+    thread->impl = handle;
     thread->started = false;
-    if (pthread_create(&thread->handle, NULL, function, context) != 0) {
+    if (pthread_create(handle, NULL, function, context) != 0) {
+        tpMemFree(handle);
+        thread->impl = NULL;
         return false;
     }
     thread->started = true;
@@ -627,10 +646,12 @@ bool platformThreadJoin(PlatformThread* thread, void** result) {
         return false;
     }
 
-    if (pthread_join(thread->handle, result) != 0) {
+    if (pthread_join(*platformThreadHandle(thread), result) != 0) {
         return false;
     }
 
+    tpMemFree(thread->impl);
+    thread->impl = NULL;
     thread->started = false;
     return true;
 }
@@ -640,25 +661,40 @@ bool platformThreadDetach(PlatformThread* thread) {
         return false;
     }
 
-    if (pthread_detach(thread->handle) != 0) {
+    if (pthread_detach(*platformThreadHandle(thread)) != 0) {
         return false;
     }
 
+    tpMemFree(thread->impl);
+    thread->impl = NULL;
     thread->started = false;
     return true;
 }
 
 uint64_t platformThreadCurrentId(void) {
-    return (uint64_t)(uintptr_t)pthread_self();
+    pthread_t self = pthread_self();
+    uint64_t out = 0;
+    memcpy(&out, &self, sizeof(self) < sizeof(out) ? sizeof(self) : sizeof(out));
+    return out;
 }
 
 bool platformMutexInit(PlatformMutex* mutex) {
+    PlatformMutexHandle* handle;
+
     if (mutex == NULL) {
         return false;
     }
 
+    handle = (PlatformMutexHandle*)tpMemAlloc(sizeof(PlatformMutexHandle));
+    if (handle == NULL) {
+        return false;
+    }
+
+    mutex->impl = handle;
     mutex->initialized = false;
-    if (pthread_mutex_init(&mutex->handle, NULL) != 0) {
+    if (pthread_mutex_init(handle, NULL) != 0) {
+        tpMemFree(handle);
+        mutex->impl = NULL;
         return false;
     }
     mutex->initialized = true;
@@ -669,29 +705,41 @@ void platformMutexDestroy(PlatformMutex* mutex) {
     if (mutex == NULL || !mutex->initialized) {
         return;
     }
-    pthread_mutex_destroy(&mutex->handle);
+    pthread_mutex_destroy(platformMutexHandle(mutex));
+    tpMemFree(mutex->impl);
+    mutex->impl = NULL;
     mutex->initialized = false;
 }
 
 void platformMutexLock(PlatformMutex* mutex) {
     if (mutex != NULL && mutex->initialized) {
-        pthread_mutex_lock(&mutex->handle);
+        pthread_mutex_lock(platformMutexHandle(mutex));
     }
 }
 
 void platformMutexUnlock(PlatformMutex* mutex) {
     if (mutex != NULL && mutex->initialized) {
-        pthread_mutex_unlock(&mutex->handle);
+        pthread_mutex_unlock(platformMutexHandle(mutex));
     }
 }
 
 bool platformCondVarInit(PlatformCondVar* cond) {
+    PlatformCondVarHandle* handle;
+
     if (cond == NULL) {
         return false;
     }
 
+    handle = (PlatformCondVarHandle*)tpMemAlloc(sizeof(PlatformCondVarHandle));
+    if (handle == NULL) {
+        return false;
+    }
+
+    cond->impl = handle;
     cond->initialized = false;
-    if (pthread_cond_init(&cond->handle, NULL) != 0) {
+    if (pthread_cond_init(handle, NULL) != 0) {
+        tpMemFree(handle);
+        cond->impl = NULL;
         return false;
     }
     cond->initialized = true;
@@ -702,7 +750,9 @@ void platformCondVarDestroy(PlatformCondVar* cond) {
     if (cond == NULL || !cond->initialized) {
         return;
     }
-    pthread_cond_destroy(&cond->handle);
+    pthread_cond_destroy(platformCondHandle(cond));
+    tpMemFree(cond->impl);
+    cond->impl = NULL;
     cond->initialized = false;
 }
 
@@ -710,52 +760,62 @@ void platformCondVarWait(PlatformCondVar* cond, PlatformMutex* mutex) {
     if (cond == NULL || mutex == NULL || !cond->initialized || !mutex->initialized) {
         return;
     }
-    pthread_cond_wait(&cond->handle, &mutex->handle);
+    pthread_cond_wait(platformCondHandle(cond), platformMutexHandle(mutex));
 }
 
 void platformCondVarSignal(PlatformCondVar* cond) {
     if (cond != NULL && cond->initialized) {
-        pthread_cond_signal(&cond->handle);
+        pthread_cond_signal(platformCondHandle(cond));
     }
 }
 
 void platformCondVarBroadcast(PlatformCondVar* cond) {
     if (cond != NULL && cond->initialized) {
-        pthread_cond_broadcast(&cond->handle);
+        pthread_cond_broadcast(platformCondHandle(cond));
     }
 }
 
 void platformAtomicInit(PlatformAtomicInt* value, int64_t initialValue) {
-    if (value != NULL) {
-        atomic_init(&value->value, initialValue);
+    PlatformAtomicHandle* handle;
+
+    if (value == NULL) {
+        return;
     }
+
+    handle = (PlatformAtomicHandle*)tpMemAlloc(sizeof(PlatformAtomicHandle));
+    if (handle == NULL) {
+        value->impl = NULL;
+        return;
+    }
+    atomic_init(handle, initialValue);
+    value->impl = handle;
 }
 
 int64_t platformAtomicLoad(const PlatformAtomicInt* value) {
-    if (value == NULL) {
+    if (value == NULL || value->impl == NULL) {
         return 0;
     }
-    return atomic_load(&((PlatformAtomicInt*)value)->value);
+    return atomic_load(platformAtomicHandleConst(value));
 }
 
 void platformAtomicStore(PlatformAtomicInt* value, int64_t newValue) {
-    if (value != NULL) {
-        atomic_store(&value->value, newValue);
+    if (value != NULL && value->impl != NULL) {
+        atomic_store(platformAtomicHandle(value), newValue);
     }
 }
 
 int64_t platformAtomicFetchAdd(PlatformAtomicInt* value, int64_t delta) {
-    if (value == NULL) {
+    if (value == NULL || value->impl == NULL) {
         return 0;
     }
-    return atomic_fetch_add(&value->value, delta);
+    return atomic_fetch_add(platformAtomicHandle(value), delta);
 }
 
 int64_t platformAtomicFetchSub(PlatformAtomicInt* value, int64_t delta) {
-    if (value == NULL) {
+    if (value == NULL || value->impl == NULL) {
         return 0;
     }
-    return atomic_fetch_sub(&value->value, delta);
+    return atomic_fetch_sub(platformAtomicHandle(value), delta);
 }
 
 bool platformAtomicCompareExchange(PlatformAtomicInt* value,
@@ -764,7 +824,10 @@ bool platformAtomicCompareExchange(PlatformAtomicInt* value,
     if (value == NULL || expected == NULL) {
         return false;
     }
-    return atomic_compare_exchange_strong(&value->value, expected, desired);
+    if (value->impl == NULL) {
+        return false;
+    }
+    return atomic_compare_exchange_strong(platformAtomicHandle(value), expected, desired);
 }
 
 bool platformEventInit(PlatformEvent* event, bool signaled) {
@@ -832,7 +895,7 @@ PlatformThreadPool* platformThreadPoolCreate(int threadCount) {
         threadCount = platformHardwareThreadCount();
     }
 
-    pool = (PlatformThreadPool*)calloc(1, sizeof(PlatformThreadPool));
+    pool = (PlatformThreadPool*)tpMemCalloc(1, sizeof(PlatformThreadPool));
     if (pool == NULL) {
         return NULL;
     }
@@ -849,8 +912,8 @@ PlatformThreadPool* platformThreadPoolCreate(int threadCount) {
         pool->queueCapacity = 16;
     }
 
-    pool->queue = (PlatformQueuedTask*)calloc((size_t)pool->queueCapacity, sizeof(PlatformQueuedTask));
-    pool->threads = (PlatformThread*)calloc((size_t)threadCount, sizeof(PlatformThread));
+    pool->queue = (PlatformQueuedTask*)tpMemCalloc((size_t)pool->queueCapacity, sizeof(PlatformQueuedTask));
+    pool->threads = (PlatformThread*)tpMemCalloc((size_t)threadCount, sizeof(PlatformThread));
     if (pool->queue == NULL || pool->threads == NULL) {
         platformWriteLastError(pool, "failed to allocate thread pool resources");
         platformThreadPoolDestroy(pool);
@@ -901,14 +964,14 @@ void platformThreadPoolDestroy(PlatformThreadPool* pool) {
             platformTaskStateComplete(task->state);
             platformTaskStateRelease(task->state);
         }
-        free(pool->queue);
+        tpMemFree(pool->queue);
     }
 
-    free(pool->threads);
+    tpMemFree(pool->threads);
     platformCondVarDestroy(&pool->idleCond);
     platformCondVarDestroy(&pool->cond);
     platformMutexDestroy(&pool->mutex);
-    free(pool);
+    tpMemFree(pool);
 }
 
 int platformThreadPoolThreadCount(PlatformThreadPool* pool) {
@@ -1042,7 +1105,7 @@ bool platformThreadPoolParallelFor(PlatformThreadPool* pool,
         return true;
     }
 
-    handles = (PlatformTaskHandle*)calloc((size_t)taskCount, sizeof(PlatformTaskHandle));
+    handles = (PlatformTaskHandle*)tpMemCalloc((size_t)taskCount, sizeof(PlatformTaskHandle));
     if (handles == NULL) {
         platformWriteLastError(pool, "failed to allocate parallel_for handles");
         return false;
@@ -1052,14 +1115,14 @@ bool platformThreadPoolParallelFor(PlatformThreadPool* pool,
     state.context = context;
     if (!platformEventInit(&state.done, false)) {
         platformWriteLastError(pool, "failed to initialize parallel_for event");
-        free(handles);
+        tpMemFree(handles);
         return false;
     }
     platformAtomicInit(&state.remaining, taskCount);
 
     begin = start;
     for (index = 0; index < taskCount; index++) {
-        PlatformParallelForTask* task = (PlatformParallelForTask*)malloc(sizeof(PlatformParallelForTask));
+        PlatformParallelForTask* task = (PlatformParallelForTask*)tpMemAlloc(sizeof(PlatformParallelForTask));
         if (task == NULL) {
             platformWriteLastError(pool, "failed to allocate parallel_for task");
             break;
@@ -1074,7 +1137,7 @@ bool platformThreadPoolParallelFor(PlatformThreadPool* pool,
         begin = task->end;
 
         if (!platformThreadPoolSubmit(pool, platformParallelForRunRange, task, &handles[index])) {
-            free(task);
+            tpMemFree(task);
             break;
         }
     }
@@ -1086,7 +1149,7 @@ bool platformThreadPoolParallelFor(PlatformThreadPool* pool,
             platformTaskHandleDestroy(&handles[j]);
         }
         platformEventDestroy(&state.done);
-        free(handles);
+        tpMemFree(handles);
         return false;
     }
 
@@ -1098,6 +1161,6 @@ bool platformThreadPoolParallelFor(PlatformThreadPool* pool,
     }
 
     platformEventDestroy(&state.done);
-    free(handles);
+    tpMemFree(handles);
     return true;
 }

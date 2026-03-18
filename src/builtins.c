@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include "tensorpy/common.h"
+#include "tensorpy/memory.h"
 #include "tensorpy/object.h"
 #include "tensorpy/platform.h"
 #include "tensorpy/value.h"
@@ -139,13 +140,13 @@ static bool parseShapeValue(Value value, int** outShape, int* outRank) {
     int* shape;
 
     if (IS_NUMBER(value)) {
-        shape = (int*)malloc(sizeof(int));
+        shape = (int*)tpMemAlloc(sizeof(int));
         if (shape == NULL) {
             return false;
         }
         shape[0] = (int)AS_NUMBER(value);
         if (shape[0] < 0) {
-            free(shape);
+            tpMemFree(shape);
             return false;
         }
         *outShape = shape;
@@ -158,7 +159,7 @@ static bool parseShapeValue(Value value, int** outShape, int* outRank) {
         return false;
     }
 
-    shape = count > 0 ? (int*)malloc(sizeof(int) * (size_t)count) : NULL;
+    shape = count > 0 ? (int*)tpMemAlloc(sizeof(int) * (size_t)count) : NULL;
     if (count > 0 && shape == NULL) {
         return false;
     }
@@ -166,12 +167,12 @@ static bool parseShapeValue(Value value, int** outShape, int* outRank) {
     for (i = 0; i < count; i++) {
         Value item = sequenceValueAt(value, i);
         if (!IS_NUMBER(item)) {
-            free(shape);
+            tpMemFree(shape);
             return false;
         }
         shape[i] = (int)AS_NUMBER(item);
         if (shape[i] < 0) {
-            free(shape);
+            tpMemFree(shape);
             return false;
         }
     }
@@ -200,7 +201,7 @@ static bool inferTensorShape(Value value, int** outShape, int* outRank) {
     }
 
     if (count == 0) {
-        shape = (int*)malloc(sizeof(int));
+        shape = (int*)tpMemAlloc(sizeof(int));
         if (shape == NULL) {
             return false;
         }
@@ -218,28 +219,28 @@ static bool inferTensorShape(Value value, int** outShape, int* outRank) {
         int* otherShape = NULL;
         int otherRank = 0;
         if (!inferTensorShape(sequenceValueAt(value, i), &otherShape, &otherRank)) {
-            free(childShape);
+            tpMemFree(childShape);
             return false;
         }
         if (otherRank != childRank ||
             (childRank > 0 && memcmp(otherShape, childShape, sizeof(int) * (size_t)childRank) != 0)) {
-            free(otherShape);
-            free(childShape);
+            tpMemFree(otherShape);
+            tpMemFree(childShape);
             return false;
         }
-        free(otherShape);
+        tpMemFree(otherShape);
     }
 
-    shape = (int*)malloc(sizeof(int) * (size_t)(childRank + 1));
+    shape = (int*)tpMemAlloc(sizeof(int) * (size_t)(childRank + 1));
     if (shape == NULL) {
-        free(childShape);
+        tpMemFree(childShape);
         return false;
     }
     shape[0] = count;
     if (childRank > 0) {
         memcpy(shape + 1, childShape, sizeof(int) * (size_t)childRank);
     }
-    free(childShape);
+    tpMemFree(childShape);
     *outShape = shape;
     *outRank = childRank + 1;
     return true;
@@ -472,6 +473,8 @@ static bool syncTensorToMetal(ObjTensor* tensor) {
     if (tensor == NULL || tensor->device->kind != TP_DEVICE_METAL || tensor->metalBuffer == NULL) {
         return true;
     }
+    tensor->metalDirty = false;
+    tensor->cpuDirty = false;
     return tpMetalBufferWrite(tensor->metalBuffer,
                               tensor->data,
                               sizeof(float) * (size_t)(tensor->size > 0 ? tensor->size : 1));
@@ -481,6 +484,11 @@ static bool syncTensorFromMetal(ObjTensor* tensor) {
     if (tensor == NULL || tensor->device->kind != TP_DEVICE_METAL || tensor->metalBuffer == NULL) {
         return true;
     }
+    if (!tensor->cpuDirty) {
+        return true;
+    }
+    tensor->cpuDirty = false;
+    tensor->metalDirty = false;
     return tpMetalBufferRead(tensor->metalBuffer,
                              tensor->data,
                              sizeof(float) * (size_t)(tensor->size > 0 ? tensor->size : 1));
@@ -493,6 +501,12 @@ static bool canRunMetalElementwise(const ObjTensor* a, const ObjTensor* b) {
            a->metalBuffer != NULL &&
            b->metalBuffer != NULL &&
            tensorShapeEquals(a, b);
+}
+
+static bool canRunMetalScalarElementwise(const ObjTensor* tensor) {
+    return tpMetalBackendIsAvailable(vm.metalBackend) &&
+           tensor->device->kind == TP_DEVICE_METAL &&
+           tensor->metalBuffer != NULL;
 }
 
 static float applyBinaryScalar(float a, float b, TPTensorBinaryOp op) {
@@ -563,7 +577,9 @@ static ObjTensor* tensorBinaryTensorOp(const ObjTensor* a,
         } else if (op == TP_TENSOR_BINARY_MUL) {
             ok = tpMetalMulF32(vm.metalBackend, a->metalBuffer, b->metalBuffer, out->metalBuffer, outSize);
         }
-        if (ok && syncTensorFromMetal(out)) {
+        if (ok) {
+            out->cpuDirty = true;
+            out->metalDirty = false;
             free(outShape);
             if (!setAutogradBinary(out, (ObjTensor*)a, (ObjTensor*)b, gradOp)) {
                 return NULL;
@@ -573,6 +589,11 @@ static ObjTensor* tensorBinaryTensorOp(const ObjTensor* a,
     }
 
     if (tensorShapeEquals(a, b) && tensorShapeEquals(a, out)) {
+        if (!syncTensorFromMetal((ObjTensor*)a) || !syncTensorFromMetal((ObjTensor*)b)) {
+            free(outShape);
+            vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+            return NULL;
+        }
         if (op == TP_TENSOR_BINARY_ADD) {
             tpComputeAddF32(&vm.compute, a->data, b->data, out->data, outSize, TP_COMPUTE_MODE_AUTO, NULL);
         } else if (op == TP_TENSOR_BINARY_MUL) {
@@ -606,6 +627,14 @@ static ObjTensor* tensorBinaryTensorOp(const ObjTensor* a,
 
     if (outRank > 0) {
         fillStrides(outShape, outRank, outStrides);
+    }
+    if (!syncTensorFromMetal((ObjTensor*)a) || !syncTensorFromMetal((ObjTensor*)b)) {
+        free(outStrides);
+        free(aStrides);
+        free(bStrides);
+        free(outShape);
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+        return NULL;
     }
     if (a->rank > 0) {
         fillStrides(a->shape, a->rank, aStrides);
@@ -643,6 +672,25 @@ static ObjTensor* tensorBinaryScalarOp(const ObjTensor* tensor,
         return NULL;
     }
 
+    if ((op == TP_TENSOR_BINARY_ADD || op == TP_TENSOR_BINARY_MUL) &&
+        canRunMetalScalarElementwise(tensor) &&
+        !scalarOnLeft) {
+        bool ok = op == TP_TENSOR_BINARY_ADD
+            ? tpMetalAddScalarF32(vm.metalBackend, tensor->metalBuffer, scalar, out->metalBuffer, tensor->size)
+            : tpMetalMulScalarF32(vm.metalBackend, tensor->metalBuffer, scalar, out->metalBuffer, tensor->size);
+        if (ok) {
+            out->cpuDirty = true;
+            out->metalDirty = false;
+        } else {
+            vmRaiseExceptionMessage("RuntimeError", "Metal scalar kernel failed.");
+            return NULL;
+        }
+    } else {
+    if (!syncTensorFromMetal((ObjTensor*)tensor)) {
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+        return NULL;
+    }
+
     if (!scalarOnLeft && op == TP_TENSOR_BINARY_ADD) {
         tpComputeFillF32(&vm.compute, out->data, tensor->size, scalar, TP_COMPUTE_MODE_AUTO, NULL);
         tpComputeAddF32(&vm.compute, tensor->data, out->data, out->data, tensor->size, TP_COMPUTE_MODE_AUTO, NULL);
@@ -658,6 +706,7 @@ static ObjTensor* tensorBinaryScalarOp(const ObjTensor* tensor,
             out->data[i] = applyBinaryScalar(lhs, rhs, op);
         }
         syncTensorToMetal(out);
+    }
     }
     scalarTensor = newScalarTensor(scalar, tensor->device);
     if (scalarTensor == NULL) {
@@ -704,6 +753,10 @@ static ObjTensor* tensorUnaryOp(const ObjTensor* tensor, TPTensorUnaryOp op) {
         vmRaiseExceptionMessage("RuntimeError", "Out of memory while creating tensor.");
         return NULL;
     }
+    if (!syncTensorFromMetal((ObjTensor*)tensor)) {
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+        return NULL;
+    }
     for (i = 0; i < tensor->size; i++) {
         out->data[i] = applyUnaryScalar(tensor->data[i], op);
     }
@@ -725,6 +778,10 @@ static Value tensorReduceNumber(const ObjTensor* tensor, const char* kind) {
 
     if (tensor->size == 0) {
         vmRaiseExceptionMessage("ValueError", "Reduction on empty tensor.");
+        return NIL_VAL;
+    }
+    if (!syncTensorFromMetal((ObjTensor*)tensor)) {
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
         return NIL_VAL;
     }
 
@@ -750,6 +807,7 @@ static Value tensorMatmul(Value left, Value right) {
     ObjTensor* a;
     ObjTensor* b;
     ObjTensor* out;
+    bool useMetal;
     int i;
     int j;
     int k;
@@ -764,6 +822,10 @@ static Value tensorMatmul(Value left, Value right) {
 
     if (a->rank == 1 && b->rank == 1) {
         float dot;
+        if (!syncTensorFromMetal(a) || !syncTensorFromMetal(b)) {
+            vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+            return NIL_VAL;
+        }
         if (a->shape[0] != b->shape[0]) {
             vmRaiseExceptionMessage("ValueError", "matmul() dimension mismatch.");
             return NIL_VAL;
@@ -789,26 +851,48 @@ static Value tensorMatmul(Value left, Value right) {
             vmRaiseExceptionMessage("ValueError", "matmul() dimension mismatch.");
             return NIL_VAL;
         }
+        useMetal = (a->device->kind == TP_DEVICE_METAL || b->device->kind == TP_DEVICE_METAL) &&
+                   vm.metalDevice != NULL &&
+                   vm.metalBackend != NULL &&
+                   a->metalBuffer != NULL &&
+                   b->metalBuffer != NULL;
         shape[0] = a->shape[0];
         shape[1] = b->shape[1];
         out = createTensorFromShape(2, shape,
-                                    (a->device->kind == TP_DEVICE_METAL || b->device->kind == TP_DEVICE_METAL)
+                                    useMetal
                                         ? vm.metalDevice
                                         : vm.cpuDevice);
         if (out == NULL) {
             vmRaiseExceptionMessage("RuntimeError", "Out of memory while creating tensor.");
             return NIL_VAL;
         }
-        for (i = 0; i < shape[0]; i++) {
-            for (j = 0; j < shape[1]; j++) {
-                float total = 0.0f;
-                for (k = 0; k < a->shape[1]; k++) {
-                    total += a->data[i * a->shape[1] + k] * b->data[k * b->shape[1] + j];
-                }
-                out->data[i * shape[1] + j] = total;
+        if (useMetal &&
+            out->metalBuffer != NULL &&
+            tpMetalMatmulF32(vm.metalBackend,
+                             a->metalBuffer,
+                             b->metalBuffer,
+                             out->metalBuffer,
+                             a->shape[0],
+                             a->shape[1],
+                             b->shape[1])) {
+            out->cpuDirty = true;
+            out->metalDirty = false;
+        } else {
+            if (!syncTensorFromMetal(a) || !syncTensorFromMetal(b)) {
+                vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+                return NIL_VAL;
             }
+            for (i = 0; i < shape[0]; i++) {
+                for (j = 0; j < shape[1]; j++) {
+                    float total = 0.0f;
+                    for (k = 0; k < a->shape[1]; k++) {
+                        total += a->data[i * a->shape[1] + k] * b->data[k * b->shape[1] + j];
+                    }
+                    out->data[i * shape[1] + j] = total;
+                }
+            }
+            syncTensorToMetal(out);
         }
-        syncTensorToMetal(out);
         if (!setAutogradBinary(out, a, b, TP_AUTOGRAD_MATMUL)) {
             return NIL_VAL;
         }
@@ -817,6 +901,10 @@ static Value tensorMatmul(Value left, Value right) {
 
     if (a->rank == 2 && b->rank == 1) {
         int shape[1];
+        if (!syncTensorFromMetal(a) || !syncTensorFromMetal(b)) {
+            vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+            return NIL_VAL;
+        }
         if (a->shape[1] != b->shape[0]) {
             vmRaiseExceptionMessage("ValueError", "matmul() dimension mismatch.");
             return NIL_VAL;
@@ -846,6 +934,10 @@ static Value tensorMatmul(Value left, Value right) {
 
     if (a->rank == 1 && b->rank == 2) {
         int shape[1];
+        if (!syncTensorFromMetal(a) || !syncTensorFromMetal(b)) {
+            vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+            return NIL_VAL;
+        }
         if (a->shape[0] != b->shape[0]) {
             vmRaiseExceptionMessage("ValueError", "matmul() dimension mismatch.");
             return NIL_VAL;
@@ -891,6 +983,10 @@ static Value tensorSoftmax(Value value) {
     }
 
     tensor = AS_TENSOR(value);
+    if (!syncTensorFromMetal(tensor)) {
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+        return NIL_VAL;
+    }
     if (tensor->requiresGrad) {
         vmRaiseExceptionMessage("RuntimeError", "softmax() backward is not implemented yet.");
         return NIL_VAL;
@@ -944,6 +1040,10 @@ static Value tensorLayerNorm(Value value, float eps) {
     }
 
     tensor = AS_TENSOR(value);
+    if (!syncTensorFromMetal(tensor)) {
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+        return NIL_VAL;
+    }
     if (tensor->requiresGrad) {
         vmRaiseExceptionMessage("RuntimeError", "layernorm() backward is not implemented yet.");
         return NIL_VAL;
@@ -2577,6 +2677,10 @@ static Value mlConv2dNative(int argCount, Value* args) {
 
 static Value mlToListNative(int argCount, Value* args) {
     if (argCount != 1 || !IS_TENSOR(args[0])) return NIL_VAL;
+    if (!syncTensorFromMetal(AS_TENSOR(args[0]))) {
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+        return NIL_VAL;
+    }
     return tensorToListValue(AS_TENSOR(args[0]));
 }
 

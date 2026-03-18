@@ -1,8 +1,17 @@
 # TensorPy
 
-TensorPy is a small Python-like interpreter written in C. It currently supports a useful subset of Python syntax, core data structures, exceptions, a simple module system, and a growing standard-library-style layer implemented in TensorPy itself.
+TensorPy is an AI Native Python interpreter written in C. It is built around a practical Python-like language core plus native support for tensors, devices, autograd, atomics, SIMD compute paths, threading primitives, and explicit Metal acceleration on Apple Silicon.
 
-This project is still in an active build-out phase. The goal right now is practical language coverage and runtime stability, not full CPython or MicroPython compatibility.
+This project is still in an active build-out phase. The goal is not full CPython compatibility. The goal is a compact, hackable, high-performance interpreter that feels Pythonic while treating ML and systems primitives as first-class runtime features instead of bolted-on libraries.
+
+## Positioning
+
+TensorPy aims to be:
+
+- an AI Native Python interpreter, not just a Python-like scripting language
+- native-first for `tensor`, `device`, and training workflows
+- systems-aware, with built-in concurrency primitives, atomics, SIMD, and portability layers
+- small enough to understand, modify, and extend without a giant runtime stack
 
 ## Current Features
 
@@ -47,43 +56,15 @@ This project is still in an active build-out phase. The goal right now is practi
   - `types`
   - `inspect`
 - Platform-facing runtime operations are routed through a portability layer in `src/platform.c`
+- Native ML runtime with `tensor`, `dtype`, `device`, autograd primitives, and eager ops
+- Runtime concurrency layer with threads, mutexes, condition variables, atomics, thread pool, and `parallel_for`
+- CPU compute backend with scalar, SIMD, and threaded execution paths for core float32 kernels
+- Apple Silicon Metal backend with explicit opt-in execution and a portable no-Metal build mode
 - CPU remains the default execution device for compatibility; Metal is explicit opt-in
 
 ## Milestone Status
 
-- `Phase 1`: completed
-  - common builtins expanded
-  - reflection helpers added
-  - `math`, `time`, `random`, and `os` modules added
-  - platform abstraction layer added for system-facing operations
-- `Phase 2`: completed
-  - module globals are isolated from script globals
-  - module cache is active across repeated imports
-  - package imports now support `pkg`, `pkg.mod`, and `from pkg.mod import name`
-  - package submodules are attached back onto parent package objects
-- `Phase 3`: completed
-  - exception matching and exception objects were made more Python-like
-  - function call argument checking and keyword handling were tightened
-  - nested functions now capture outer bindings
-  - `json` validation and `re` alternation support received a second pass
-  - REPL multi-line block input was improved
-- `Phase 4`: completed
-  - focus: GC readiness and memory model stabilization
-  - object environment and closure ownership have been normalized ahead of GC
-  - a non-collecting mark walker now traverses VM roots and heap object edges
-  - object finalization and VM teardown now free heap-owned buffers and objects
-  - an explicit mark-and-sweep collector now reclaims unreachable heap objects
-  - a conservative automatic GC trigger now runs from object allocation thresholds
-  - next step: ML runtime work on top of the stabilized runtime
-- `Phase 5`: in progress
-  - runtime concurrency foundation is in place via thread, mutex, condvar, atomics, thread pool, and `parallel_for`
-  - CPU compute infrastructure now includes scalar, SIMD, and threaded paths for core float32 kernels
-  - a native ML object model now exists with `tensor`, `dtype`, and `device`
-  - the builtin `ml` module now provides eager tensor creation, reshape/cast/device transfer, elementwise ops, reductions, activations, and `matmul`
-  - CPU-side autograd is now available for a training-ready subset: `Parameter`, `mse_loss`, `backward()`, `zero_grad`, and `sgd_step`
-  - CPU is the default device; `metal` must be selected explicitly
-  - Apple Silicon Metal backend is wired in for explicit `metal` tensors with CPU fallback for unsupported or conservative paths
-  - next step: stabilize more CPU training primitives, then expand true Metal kernel coverage for high-value ops such as `matmul`, reductions, `softmax`, and `layernorm`
+See [ROADMAP.md](/Users/tensorcraft/Projects/TensorPy/ROADMAP.md) for the tracked checklist of completed work, in-flight work, and next priorities.
 
 ## Implemented Library Surface
 
@@ -244,6 +225,12 @@ other internal runtime headers. The detailed readiness notes live in:
 
 ```bash
 make
+```
+
+To build without Metal support:
+
+```bash
+make METAL=0
 ```
 
 This produces the interpreter binary:

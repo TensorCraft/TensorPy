@@ -1,8 +1,19 @@
 CC = clang
 CFLAGS = -Wall -Wextra -Iinclude -O2 -pthread
-LDFLAGS = -framework Foundation -framework Metal
-SRC = src/api.c src/object.c src/value.c src/builtins.c src/platform.c src/compute.c src/table.c src/chunk.c src/vm.c src/debug.c src/scanner.c src/compiler.c src/main.c
+SRC = src/api.c src/object.c src/value.c src/builtins.c src/platform.c src/compute.c src/table.c src/chunk.c src/vm.c src/debug.c src/scanner.c src/compiler.c src/main.c src/memory.c
+METAL ?= 1
+
+ifeq ($(METAL),1)
 OBJC_SRC = src/metal.m
+CFLAGS += -DTP_ENABLE_METAL=1
+LDFLAGS = -framework Foundation -framework Metal
+else
+SRC += src/metal_stub.c
+CFLAGS += -DTP_ENABLE_METAL=0
+LDFLAGS =
+OBJC_SRC =
+endif
+
 OBJ = $(SRC:.c=.o) $(OBJC_SRC:.m=.o)
 TARGET = tensorpy
 PLATFORM_TEST = platform_concurrency_test

@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "tensorpy/metal.h"
+#include "tensorpy/memory.h"
 
 struct TPMetalBackend {
     id<MTLDevice> device;
@@ -13,6 +14,9 @@ struct TPMetalBackend {
     id<MTLComputePipelineState> fillPipeline;
     id<MTLComputePipelineState> addPipeline;
     id<MTLComputePipelineState> mulPipeline;
+    id<MTLComputePipelineState> addScalarPipeline;
+    id<MTLComputePipelineState> mulScalarPipeline;
+    id<MTLComputePipelineState> matmulPipeline;
     char lastError[256];
     bool available;
 };
@@ -59,8 +63,11 @@ TPMetalBackend* tpMetalBackendCreate(void) {
          "using namespace metal;\n"
          "kernel void fill_f32(device float* out [[buffer(0)]], constant float& value [[buffer(1)]], constant uint& count [[buffer(2)]], uint gid [[thread_position_in_grid]]) { if (gid < count) out[gid] = value; }\n"
          "kernel void add_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]], constant uint& count [[buffer(3)]], uint gid [[thread_position_in_grid]]) { if (gid < count) out[gid] = a[gid] + b[gid]; }\n"
-         "kernel void mul_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]], constant uint& count [[buffer(3)]], uint gid [[thread_position_in_grid]]) { if (gid < count) out[gid] = a[gid] * b[gid]; }\n";
-    TPMetalBackend* backend = (TPMetalBackend*)calloc(1, sizeof(TPMetalBackend));
+         "kernel void mul_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]], constant uint& count [[buffer(3)]], uint gid [[thread_position_in_grid]]) { if (gid < count) out[gid] = a[gid] * b[gid]; }\n"
+         "kernel void add_scalar_f32(device const float* input [[buffer(0)]], constant float& scalar [[buffer(1)]], device float* out [[buffer(2)]], constant uint& count [[buffer(3)]], uint gid [[thread_position_in_grid]]) { if (gid < count) out[gid] = input[gid] + scalar; }\n"
+         "kernel void mul_scalar_f32(device const float* input [[buffer(0)]], constant float& scalar [[buffer(1)]], device float* out [[buffer(2)]], constant uint& count [[buffer(3)]], uint gid [[thread_position_in_grid]]) { if (gid < count) out[gid] = input[gid] * scalar; }\n"
+         "kernel void matmul_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]], constant uint& m [[buffer(3)]], constant uint& n [[buffer(4)]], constant uint& p [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) { uint row = gid.y; uint col = gid.x; if (row >= m || col >= p) return; float total = 0.0f; for (uint k = 0; k < n; ++k) { total += a[row * n + k] * b[k * p + col]; } out[row * p + col] = total; }\n";
+    TPMetalBackend* backend = (TPMetalBackend*)tpMemCalloc(1, sizeof(TPMetalBackend));
     NSError* error = nil;
 
     if (backend == NULL) {
@@ -87,7 +94,10 @@ TPMetalBackend* tpMetalBackendCreate(void) {
 
     if (!tpMetalBuildPipeline(backend, @"fill_f32", &backend->fillPipeline) ||
         !tpMetalBuildPipeline(backend, @"add_f32", &backend->addPipeline) ||
-        !tpMetalBuildPipeline(backend, @"mul_f32", &backend->mulPipeline)) {
+        !tpMetalBuildPipeline(backend, @"mul_f32", &backend->mulPipeline) ||
+        !tpMetalBuildPipeline(backend, @"add_scalar_f32", &backend->addScalarPipeline) ||
+        !tpMetalBuildPipeline(backend, @"mul_scalar_f32", &backend->mulScalarPipeline) ||
+        !tpMetalBuildPipeline(backend, @"matmul_f32", &backend->matmulPipeline)) {
         return backend;
     }
 
@@ -98,7 +108,7 @@ TPMetalBackend* tpMetalBackendCreate(void) {
 
 void tpMetalBackendDestroy(TPMetalBackend* backend) {
     if (backend != NULL) {
-        free(backend);
+        tpMemFree(backend);
     }
 }
 
@@ -122,14 +132,14 @@ TPMetalBuffer* tpMetalBufferCreate(TPMetalBackend* backend,
         return NULL;
     }
 
-    buffer = (TPMetalBuffer*)calloc(1, sizeof(TPMetalBuffer));
+    buffer = (TPMetalBuffer*)tpMemCalloc(1, sizeof(TPMetalBuffer));
     if (buffer == NULL) {
         return NULL;
     }
 
     buffer->handle = [backend->device newBufferWithLength:byteLength options:MTLResourceStorageModeShared];
     if (buffer->handle == nil) {
-        free(buffer);
+        tpMemFree(buffer);
         return NULL;
     }
     buffer->byteLength = byteLength;
@@ -142,7 +152,7 @@ TPMetalBuffer* tpMetalBufferCreate(TPMetalBackend* backend,
 
 void tpMetalBufferDestroy(TPMetalBuffer* buffer) {
     if (buffer != NULL) {
-        free(buffer);
+        tpMemFree(buffer);
     }
 }
 
@@ -204,27 +214,100 @@ bool tpMetalFillF32(TPMetalBackend* backend,
     return commandBuffer.status == MTLCommandBufferStatusCompleted;
 }
 
+static bool tpMetalRunBinaryF32(TPMetalBackend* backend,
+                                id<MTLComputePipelineState> pipeline,
+                                TPMetalBuffer* a,
+                                TPMetalBuffer* b,
+                                TPMetalBuffer* out,
+                                int count) {
+    id<MTLCommandBuffer> commandBuffer;
+    id<MTLComputeCommandEncoder> encoder;
+    NSUInteger width;
+    MTLSize gridSize;
+    MTLSize threadgroupSize;
+    uint32_t countValue = (uint32_t)count;
+
+    if (backend == NULL || !backend->available || a == NULL || b == NULL || out == NULL) {
+        return false;
+    }
+    if (a->handle == nil || b->handle == nil || out->handle == nil) {
+        return false;
+    }
+
+    commandBuffer = [backend->queue commandBuffer];
+    encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:a->handle offset:0 atIndex:0];
+    [encoder setBuffer:b->handle offset:0 atIndex:1];
+    [encoder setBuffer:out->handle offset:0 atIndex:2];
+    [encoder setBytes:&countValue length:sizeof(uint32_t) atIndex:3];
+
+    width = pipeline.maxTotalThreadsPerThreadgroup;
+    if (width > (NSUInteger)count && count > 0) {
+        width = (NSUInteger)count;
+    }
+    if (width == 0) {
+        width = 1;
+    }
+    gridSize = MTLSizeMake((NSUInteger)count, 1, 1);
+    threadgroupSize = MTLSizeMake(width, 1, 1);
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    return commandBuffer.status == MTLCommandBufferStatusCompleted;
+}
+
+static bool tpMetalRunScalarBinaryF32(TPMetalBackend* backend,
+                                      id<MTLComputePipelineState> pipeline,
+                                      TPMetalBuffer* input,
+                                      float scalar,
+                                      TPMetalBuffer* out,
+                                      int count) {
+    id<MTLCommandBuffer> commandBuffer;
+    id<MTLComputeCommandEncoder> encoder;
+    NSUInteger width;
+    MTLSize gridSize;
+    MTLSize threadgroupSize;
+    uint32_t countValue = (uint32_t)count;
+
+    if (backend == NULL || !backend->available || input == NULL || out == NULL) {
+        return false;
+    }
+    if (input->handle == nil || out->handle == nil) {
+        return false;
+    }
+
+    commandBuffer = [backend->queue commandBuffer];
+    encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:input->handle offset:0 atIndex:0];
+    [encoder setBytes:&scalar length:sizeof(float) atIndex:1];
+    [encoder setBuffer:out->handle offset:0 atIndex:2];
+    [encoder setBytes:&countValue length:sizeof(uint32_t) atIndex:3];
+
+    width = pipeline.maxTotalThreadsPerThreadgroup;
+    if (width > (NSUInteger)count && count > 0) {
+        width = (NSUInteger)count;
+    }
+    if (width == 0) {
+        width = 1;
+    }
+    gridSize = MTLSizeMake((NSUInteger)count, 1, 1);
+    threadgroupSize = MTLSizeMake(width, 1, 1);
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    return commandBuffer.status == MTLCommandBufferStatusCompleted;
+}
+
 bool tpMetalAddF32(TPMetalBackend* backend,
                    TPMetalBuffer* a,
                    TPMetalBuffer* b,
                    TPMetalBuffer* out,
                    int count) {
-    float* aData;
-    float* bData;
-    float* outData;
-    int i;
-
-    if (backend == NULL || !backend->available || a == NULL || b == NULL || out == NULL) {
-        return false;
-    }
-
-    aData = (float*)[a->handle contents];
-    bData = (float*)[b->handle contents];
-    outData = (float*)[out->handle contents];
-    for (i = 0; i < count; i++) {
-        outData[i] = aData[i] + bData[i];
-    }
-    return true;
+    return tpMetalRunBinaryF32(backend, backend->addPipeline, a, b, out, count);
 }
 
 bool tpMetalMulF32(TPMetalBackend* backend,
@@ -232,20 +315,85 @@ bool tpMetalMulF32(TPMetalBackend* backend,
                    TPMetalBuffer* b,
                    TPMetalBuffer* out,
                    int count) {
-    float* aData;
-    float* bData;
-    float* outData;
-    int i;
+    return tpMetalRunBinaryF32(backend, backend->mulPipeline, a, b, out, count);
+}
+
+bool tpMetalAddScalarF32(TPMetalBackend* backend,
+                         TPMetalBuffer* input,
+                         float scalar,
+                         TPMetalBuffer* out,
+                         int count) {
+    return tpMetalRunScalarBinaryF32(backend, backend->addScalarPipeline, input, scalar, out, count);
+}
+
+bool tpMetalMulScalarF32(TPMetalBackend* backend,
+                         TPMetalBuffer* input,
+                         float scalar,
+                         TPMetalBuffer* out,
+                         int count) {
+    return tpMetalRunScalarBinaryF32(backend, backend->mulScalarPipeline, input, scalar, out, count);
+}
+
+bool tpMetalMatmulF32(TPMetalBackend* backend,
+                      TPMetalBuffer* a,
+                      TPMetalBuffer* b,
+                      TPMetalBuffer* out,
+                      int m,
+                      int n,
+                      int p) {
+    id<MTLCommandBuffer> commandBuffer;
+    id<MTLComputeCommandEncoder> encoder;
+    MTLSize gridSize;
+    MTLSize threadgroupSize;
+    NSUInteger width;
+    NSUInteger height;
+    uint32_t mValue = (uint32_t)m;
+    uint32_t nValue = (uint32_t)n;
+    uint32_t pValue = (uint32_t)p;
 
     if (backend == NULL || !backend->available || a == NULL || b == NULL || out == NULL) {
         return false;
     }
-
-    aData = (float*)[a->handle contents];
-    bData = (float*)[b->handle contents];
-    outData = (float*)[out->handle contents];
-    for (i = 0; i < count; i++) {
-        outData[i] = aData[i] * bData[i];
+    if (a->handle == nil || b->handle == nil || out->handle == nil) {
+        return false;
     }
-    return true;
+    if (m <= 0 || n <= 0 || p <= 0) {
+        return false;
+    }
+
+    commandBuffer = [backend->queue commandBuffer];
+    encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:backend->matmulPipeline];
+    [encoder setBuffer:a->handle offset:0 atIndex:0];
+    [encoder setBuffer:b->handle offset:0 atIndex:1];
+    [encoder setBuffer:out->handle offset:0 atIndex:2];
+    [encoder setBytes:&mValue length:sizeof(uint32_t) atIndex:3];
+    [encoder setBytes:&nValue length:sizeof(uint32_t) atIndex:4];
+    [encoder setBytes:&pValue length:sizeof(uint32_t) atIndex:5];
+
+    width = backend->matmulPipeline.threadExecutionWidth;
+    if (width == 0) {
+        width = 8;
+    }
+    if (width > (NSUInteger)p) {
+        width = (NSUInteger)p;
+    }
+    if (width == 0) {
+        width = 1;
+    }
+    height = backend->matmulPipeline.maxTotalThreadsPerThreadgroup / width;
+    if (height == 0) {
+        height = 1;
+    }
+    if (height > (NSUInteger)m) {
+        height = (NSUInteger)m;
+    }
+
+    gridSize = MTLSizeMake((NSUInteger)p, (NSUInteger)m, 1);
+    threadgroupSize = MTLSizeMake(width, height, 1);
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    return commandBuffer.status == MTLCommandBufferStatusCompleted;
 }

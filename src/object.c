@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "tensorpy/object.h"
+#include "tensorpy/memory.h"
 #include "tensorpy/table.h"
 #include "tensorpy/value.h"
 #include "tensorpy/vm.h"
@@ -16,7 +17,7 @@ static Obj* allocateObject(size_t size, ObjType type) {
         gcCollect();
     }
 
-    Obj* object = (Obj*)malloc(size);
+    Obj* object = (Obj*)tpMemAlloc(size);
     object->type = type;
     object->isMarked = false;
     object->next = vm.objects;
@@ -85,7 +86,7 @@ static void fillTensorStrides(const ObjTensor* tensor, int* outStrides) {
 static void freeObject(Obj* object) {
     switch (object->type) {
         case OBJ_STRING:
-            free(((ObjString*)object)->chars);
+            tpMemFree(((ObjString*)object)->chars);
             break;
         case OBJ_FUNCTION: {
             ObjFunction* function = (ObjFunction*)object;
@@ -127,7 +128,7 @@ static void freeObject(Obj* object) {
             freeValueArray(&((ObjTuple*)object)->items);
             break;
         case OBJ_BYTES:
-            free(((ObjBytes*)object)->bytes);
+            tpMemFree(((ObjBytes*)object)->bytes);
             break;
         case OBJ_DEVICE:
         case OBJ_DTYPE:
@@ -135,8 +136,8 @@ static void freeObject(Obj* object) {
         case OBJ_TENSOR: {
             ObjTensor* tensor = (ObjTensor*)object;
             tpMetalBufferDestroy(tensor->metalBuffer);
-            free(tensor->shape);
-            free(tensor->data);
+            tpMemFree(tensor->shape);
+            tpMemFree(tensor->data);
             break;
         }
         case OBJ_CLASS:
@@ -148,7 +149,7 @@ static void freeObject(Obj* object) {
     }
 
     vm.objectCount--;
-    free(object);
+    tpMemFree(object);
 }
 
 ObjString* copyString(const char* chars, int length) {
@@ -156,7 +157,7 @@ ObjString* copyString(const char* chars, int length) {
     ObjString* interned = tableFindString(&vm.strings, chars, length, hash);
     if (interned != NULL) return interned;
 
-    char* heapChars = malloc(length + 1);
+    char* heapChars = tpMemAlloc(length + 1);
     memcpy(heapChars, chars, length);
     heapChars[length] = '\0';
     ObjString* string = allocateString(heapChars, length, hash);
@@ -168,7 +169,7 @@ ObjString* takeString(char* chars, int length) {
     uint32_t hash = hashString(chars, length);
     ObjString* interned = tableFindString(&vm.strings, chars, length, hash);
     if (interned != NULL) {
-        free(chars);
+        tpMemFree(chars);
         return interned;
     }
 
@@ -180,7 +181,7 @@ ObjString* takeString(char* chars, int length) {
 ObjBytes* newBytes(int length, const uint8_t* source) {
     ObjBytes* bytes = ALLOCATE_OBJ(ObjBytes, OBJ_BYTES);
     bytes->length = length;
-    bytes->bytes = (uint8_t*)malloc(length);
+    bytes->bytes = (uint8_t*)tpMemAlloc((size_t)length);
     if (source != NULL) {
         memcpy(bytes->bytes, source, length);
     }
@@ -316,7 +317,7 @@ ObjTensor* newTensor(int rank,
     }
 
     if (rank > 0) {
-        shapeCopy = (int*)malloc(sizeof(int) * (size_t)rank);
+        shapeCopy = (int*)tpMemAlloc(sizeof(int) * (size_t)rank);
         if (shapeCopy == NULL) {
             return NULL;
         }
@@ -324,9 +325,9 @@ ObjTensor* newTensor(int rank,
     }
 
     if (size > 0) {
-        dataCopy = (float*)malloc(sizeof(float) * (size_t)size);
+        dataCopy = (float*)tpMemAlloc(sizeof(float) * (size_t)size);
         if (dataCopy == NULL) {
-            free(shapeCopy);
+            tpMemFree(shapeCopy);
             return NULL;
         }
         if (source != NULL) {
@@ -338,16 +339,16 @@ ObjTensor* newTensor(int rank,
 
     if (device->kind == TP_DEVICE_METAL) {
         if (vm.metalBackend == NULL || !tpMetalBackendIsAvailable(vm.metalBackend)) {
-            free(shapeCopy);
-            free(dataCopy);
+            tpMemFree(shapeCopy);
+            tpMemFree(dataCopy);
             return NULL;
         }
         metalBuffer = tpMetalBufferCreate(vm.metalBackend,
                                           sizeof(float) * (size_t)(size > 0 ? size : 1),
                                           dataCopy);
         if (metalBuffer == NULL) {
-            free(shapeCopy);
-            free(dataCopy);
+            tpMemFree(shapeCopy);
+            tpMemFree(dataCopy);
             return NULL;
         }
     }
@@ -361,6 +362,8 @@ ObjTensor* newTensor(int rank,
     tensor->shape = shapeCopy;
     tensor->data = dataCopy;
     tensor->metalBuffer = metalBuffer;
+    tensor->cpuDirty = false;
+    tensor->metalDirty = false;
     tensor->requiresGrad = false;
     tensor->grad = NULL;
     tensor->parentA = NULL;
@@ -503,13 +506,13 @@ bool getNativeObjectAttribute(Value object, ObjString* name, Value* result) {
                 return true;
             }
 
-            strides = (int*)malloc(sizeof(int) * (size_t)tensor->rank);
+            strides = (int*)tpMemAlloc(sizeof(int) * (size_t)tensor->rank);
             if (strides == NULL) {
                 return false;
             }
             fillTensorStrides(tensor, strides);
             list = makeIntList(strides, tensor->rank);
-            free(strides);
+            tpMemFree(strides);
             *result = OBJ_VAL(list);
             return true;
         }
