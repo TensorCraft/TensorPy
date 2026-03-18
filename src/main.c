@@ -2,11 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "tensorpy/api.h"
 #include "tensorpy/common.h"
 #include "tensorpy/chunk.h"
 #include "tensorpy/debug.h"
 #include "tensorpy/platform.h"
-#include "tensorpy/vm.h"
 
 static bool startsWithKeyword(const char* line, const char* keyword) {
     size_t len = strlen(keyword);
@@ -97,7 +97,7 @@ static void repl() {
 
         if (!fgets(line, sizeof(line), stdin)) {
             if (collecting && block[0] != '\0') {
-                interpret(block, "stdin");
+                tpInterpret(block, "stdin");
             }
             printf("\n");
             break;
@@ -105,7 +105,7 @@ static void repl() {
 
         if (collecting) {
             if (isBlankLine(line)) {
-                interpret(block, "stdin");
+                tpInterpret(block, "stdin");
                 block[0] = '\0';
                 collecting = false;
                 continue;
@@ -122,9 +122,9 @@ static void repl() {
 
         if (isLikelyExpression(line)) {
             snprintf(wrapped, sizeof(wrapped), "print(%s)", line);
-            interpret(wrapped, "stdin");
+            tpInterpret(wrapped, "stdin");
         } else {
-            interpret(line, "stdin");
+            tpInterpret(line, "stdin");
         }
     }
 }
@@ -140,28 +140,28 @@ static char* readFile(const char* path) {
 
 static void runFile(const char* path) {
     char* source = readFile(path);
-    InterpretResult result = interpret(source, path);
+    TPResult result = tpInterpret(source, path);
     free(source);
 
-    if (result == INTERPRET_COMPILE_ERROR) exit(65);
-    if (result == INTERPRET_RUNTIME_ERROR) exit(70);
+    if (result == TP_COMPILE_ERROR) exit(65);
+    if (result == TP_RUNTIME_ERROR) exit(70);
 }
 
 int main(int argc, const char* argv[]) {
-    initVM();
+    tpInit();
 
     if (argc == 1) {
         repl();
     } else if (argc == 2) {
         runFile(argv[1]);
     } else if (argc == 3 && strcmp(argv[1], "-c") == 0) {
-        interpret(argv[2], "command line");
+        tpInterpret(argv[2], "command line");
     } else {
         fprintf(stderr, "Usage: tensorpy [path]\n");
         fprintf(stderr, "       tensorpy -c \"code\"\n");
         exit(64);
     }
 
-    freeVM();
+    tpFree();
     return 0;
 }

@@ -41,3 +41,13 @@ try:
     json.loads("01")
 except ValueError as e:
     print(e.message)
+
+try:
+    json.loads("1e")
+except ValueError as e:
+    print(e.message)
+
+try:
+    json.loads("\"\u0001\"")
+except ValueError as e:
+    print(e.message)

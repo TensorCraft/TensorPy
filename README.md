@@ -218,6 +218,24 @@ TensorPy is not yet a full Python implementation. Notable gaps still include:
 
 - incomplete builtin and standard library coverage
 - partial regex compatibility
+
+## C API Status
+
+TensorPy now has a minimal public embedding header:
+
+- [include/tensorpy/api.h](/Users/tensorcraft/Projects/TensorPy/include/tensorpy/api.h)
+
+That header is intentionally small and currently exposes only interpreter
+lifecycle and top-level code execution entry points.
+
+The current readiness call is:
+
+- embedding API design can begin
+- public third-party C extension ABI should wait until object/value ownership is stabilized
+
+More detail is documented in:
+
+- [docs/C_API_READINESS.md](/Users/tensorcraft/Projects/TensorPy/docs/C_API_READINESS.md)
 - missing GC work for later phases
 - incomplete Python compatibility for many edge cases and advanced syntax forms
 

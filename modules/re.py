@@ -466,12 +466,13 @@ class Match:
             else:
                 out.append(_slice_text(self.text, bounds[0], bounds[1]))
             i = i + 1
-        result = []
-        i = 0
-        while i < len(out):
-            result.append(out[i])
-            i = i + 1
-        return result
+        if len(out) == 1:
+            return (out[0],)
+        if len(out) == 2:
+            return (out[0], out[1])
+        if len(out) == 3:
+            return (out[0], out[1], out[2])
+        return out
 
 
 class Pattern:
