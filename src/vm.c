@@ -43,6 +43,7 @@ static bool collectExpandedArgs(Value* sourceArgs, int sourceCount, ObjTuple* st
 static bool collectExpandedKeywords(Value* kwSourceArgs, int kwSourceCount, ObjTuple* kwStarIndexes,
                                     Value* explicitKwNames, int explicitKwCount,
                                     Value* outKwNames, Value* outKwValues, int* outKwCount);
+static bool lookupMethodInClassChain(ObjClass* klass, ObjString* name, Value* method);
 
 static char* readFileToBuffer(const char* path) {
     return platformReadTextFile(path);
@@ -341,6 +342,21 @@ static void markObject(Obj* object) {
         case OBJ_NATIVE:
         case OBJ_BYTES:
             return;
+        case OBJ_DEVICE:
+            markObject((Obj*)((ObjDevice*)object)->name);
+            return;
+        case OBJ_DTYPE:
+            markObject((Obj*)((ObjDType*)object)->name);
+            return;
+        case OBJ_TENSOR: {
+            ObjTensor* tensor = (ObjTensor*)object;
+            markObject((Obj*)tensor->dtype);
+            markObject((Obj*)tensor->device);
+            markObject((Obj*)tensor->grad);
+            markObject((Obj*)tensor->parentA);
+            markObject((Obj*)tensor->parentB);
+            return;
+        }
         case OBJ_FUNCTION: {
             ObjFunction* function = (ObjFunction*)object;
             markValueArray(&function->defaults);
@@ -429,6 +445,9 @@ static void markRoots(void) {
     markObject((Obj*)vm.globalEnv);
     markObject((Obj*)vm.initString);
     markObject((Obj*)vm.moduleClass);
+    markObject((Obj*)vm.cpuDevice);
+    markObject((Obj*)vm.metalDevice);
+    markObject((Obj*)vm.float32DType);
     markValue(vm.lastException);
     markTable(&vm.modules);
     markTable(&vm.strings);
@@ -453,6 +472,9 @@ static void markRootsForCollection(void) {
     markObject((Obj*)vm.globalEnv);
     markObject((Obj*)vm.initString);
     markObject((Obj*)vm.moduleClass);
+    markObject((Obj*)vm.cpuDevice);
+    markObject((Obj*)vm.metalDevice);
+    markObject((Obj*)vm.float32DType);
     markValue(vm.lastException);
     markTable(&vm.modules);
 }
@@ -474,7 +496,7 @@ static int countMarkedObjects(void) {
 }
 
 static void updateNextGC(void) {
-    vm.nextGC = vm.objectCount < 64 ? 64 : vm.objectCount * 2;
+    vm.nextGC = vm.objectCount < 64 ? 64 : vm.objectCount + (vm.objectCount / 3);
 }
 
 int gcMarkRootsAndCount(void) {
@@ -613,6 +635,11 @@ void initVM() {
     vm.initString = NULL; // Prevent GC from seeing garbage
     vm.initString = copyString("__init__", 8);
     vm.moduleClass = newClass(copyString("module", 6));
+    vm.cpuDevice = newDevice(copyString("cpu", 3), TP_DEVICE_CPU);
+    vm.metalDevice = newDevice(copyString("metal", 5), TP_DEVICE_METAL);
+    vm.float32DType = newDType(copyString("float32", 7), TP_DTYPE_FLOAT32);
+    tpComputeContextInit(&vm.compute, 0, 0);
+    vm.metalBackend = tpMetalBackendCreate();
 
     registerBuiltins();
     defineGlobalClass("Exception", NULL);
@@ -637,6 +664,12 @@ void freeVM() {
     vm.globalEnv = NULL;
     vm.initString = NULL;
     vm.moduleClass = NULL;
+    vm.cpuDevice = NULL;
+    vm.metalDevice = NULL;
+    vm.float32DType = NULL;
+    tpComputeContextDestroy(&vm.compute);
+    tpMetalBackendDestroy(vm.metalBackend);
+    vm.metalBackend = NULL;
     vm.lastException = NIL_VAL;
     vm.currentNative = NULL;
     vm.nativeExceptionRaised = false;
@@ -861,12 +894,14 @@ static bool callValue(Value callee, int argCount) {
                 ObjNative* previousNative = vm.currentNative;
                 bool previousNativeExceptionRaised = vm.nativeExceptionRaised;
                 NativeFn native = nativeObj->function;
+                vm.gcPauseDepth++;
                 vm.currentNative = nativeObj;
                 vm.nativeExceptionRaised = false;
                 Value result = native(argCount, vm.stackTop - argCount);
                 bool nativeFailed = vm.nativeExceptionRaised;
                 vm.currentNative = previousNative;
                 vm.nativeExceptionRaised = previousNativeExceptionRaised;
+                vm.gcPauseDepth--;
                 if (nativeFailed) {
                     return false;
                 }
@@ -1061,7 +1096,11 @@ static bool callValueKeyword(Value callee, int posCount, int kwCount) {
 
 static bool invokeFromClassKeyword(ObjClass* klass, ObjString* name, int posCount, int kwCount) {
     Value method;
-    if (!tableGet(&klass->methods, OBJ_VAL(name), &method)) {
+    ObjClass* current = klass;
+    while (current != NULL && !tableGet(&current->methods, OBJ_VAL(name), &method)) {
+        current = current->superClass;
+    }
+    if (current == NULL) {
         runtimeError("Undefined property '%s'.", name->chars);
         return false;
     }
@@ -1076,9 +1115,13 @@ static bool invokeFromClassKeyword(ObjClass* klass, ObjString* name, int posCoun
 static bool invokeKeyword(ObjString* name, int posCount, int kwCount) {
     Value receiver = peek(posCount + 2 * kwCount);
     if (!IS_INSTANCE(receiver)) {
+        bool ok;
         // Built-ins don't fully support all keyword args yet, but we'll try
         // passing total effective argCount (pos + 2*kw)
-        return invokeBuiltinMethod(receiver, name, posCount + 2 * kwCount);
+        vm.gcPauseDepth++;
+        ok = invokeBuiltinMethod(receiver, name, posCount + 2 * kwCount);
+        vm.gcPauseDepth--;
+        return ok;
     }
     ObjInstance* instance = AS_INSTANCE(receiver);
 
@@ -1093,7 +1136,11 @@ static bool invokeKeyword(ObjString* name, int posCount, int kwCount) {
 
 static bool invokeFromClass(ObjClass* klass, ObjString* name, int argCount) {
     Value method;
-    if (!tableGet(&klass->methods, OBJ_VAL(name), &method)) {
+    ObjClass* current = klass;
+    while (current != NULL && !tableGet(&current->methods, OBJ_VAL(name), &method)) {
+        current = current->superClass;
+    }
+    if (current == NULL) {
         raiseException(createExceptionValue("AttributeError", "Undefined property."));
         return false;
     }
@@ -1236,6 +1283,114 @@ static bool isAllChars(ObjString* string, int (*predicate)(int), bool requireNon
         if (!predicate((unsigned char)string->chars[i])) return false;
     }
     return true;
+}
+
+static ObjDevice* resolveRuntimeDevice(Value value) {
+    if (IS_DEVICE(value)) {
+        return AS_DEVICE(value);
+    }
+    if (IS_STRING(value)) {
+        if (strcmp(AS_CSTRING(value), "cpu") == 0) {
+            return vm.cpuDevice;
+        }
+        if (strcmp(AS_CSTRING(value), "metal") == 0 ||
+            strcmp(AS_CSTRING(value), "metal:0") == 0) {
+            return vm.metalDevice;
+        }
+    }
+    return NULL;
+}
+
+static ObjDType* resolveRuntimeDType(Value value) {
+    if (IS_DTYPE(value)) {
+        return AS_DTYPE(value);
+    }
+    if (IS_STRING(value) && strcmp(AS_CSTRING(value), "float32") == 0) {
+        return vm.float32DType;
+    }
+    return NULL;
+}
+
+static bool parseRuntimeShape(Value value, int** outShape, int* outRank) {
+    int count;
+    int i;
+    int* shape;
+
+    if (IS_NUMBER(value)) {
+        shape = (int*)malloc(sizeof(int));
+        if (shape == NULL) {
+            return false;
+        }
+        shape[0] = (int)AS_NUMBER(value);
+        if (shape[0] < 0) {
+            free(shape);
+            return false;
+        }
+        *outShape = shape;
+        *outRank = 1;
+        return true;
+    }
+
+    if (IS_LIST(value)) {
+        count = AS_LIST(value)->items.count;
+    } else if (IS_TUPLE(value)) {
+        count = AS_TUPLE(value)->items.count;
+    } else {
+        return false;
+    }
+
+    shape = count > 0 ? (int*)malloc(sizeof(int) * (size_t)count) : NULL;
+    if (count > 0 && shape == NULL) {
+        return false;
+    }
+
+    for (i = 0; i < count; i++) {
+        Value item = IS_LIST(value)
+            ? AS_LIST(value)->items.values[i]
+            : AS_TUPLE(value)->items.values[i];
+        if (!IS_NUMBER(item)) {
+            free(shape);
+            return false;
+        }
+        shape[i] = (int)AS_NUMBER(item);
+        if (shape[i] < 0) {
+            free(shape);
+            return false;
+        }
+    }
+
+    *outShape = shape;
+    *outRank = count;
+    return true;
+}
+
+static bool invokeGlobalNativeByName(const char* name, int argCount) {
+    Value callee;
+    Value receiver = peek(argCount);
+    Value args[8];
+    int i;
+    ObjString* key = copyString(name, (int)strlen(name));
+
+    if (argCount > 8) {
+        runtimeError("Too many builtin method arguments.");
+        return false;
+    }
+    if (!environmentGet(vm.globalEnv, OBJ_VAL(key), &callee)) {
+        runtimeError("Missing builtin '%s'.", name);
+        return false;
+    }
+
+    for (i = 0; i < argCount; i++) {
+        args[argCount - 1 - i] = pop();
+    }
+    pop();
+
+    push(callee);
+    push(receiver);
+    for (i = 0; i < argCount; i++) {
+        push(args[i]);
+    }
+    return callValue(callee, argCount + 1);
 }
 
 static bool invokeBuiltinMethod(Value receiver, ObjString* name, int argCount) {
@@ -1481,6 +1636,124 @@ static bool invokeBuiltinMethod(Value receiver, ObjString* name, int argCount) {
             pop();
             push(NIL_VAL);
             return true;
+        }
+    } else if (IS_TENSOR(receiver)) {
+        ObjTensor* tensor = AS_TENSOR(receiver);
+        if (strcmp(name->chars, "reshape") == 0) {
+            int* shape = NULL;
+            int rank = 0;
+            ObjTensor* result;
+
+            if (argCount != 1) { runtimeError("reshape() takes 1 argument"); return false; }
+            if (!parseRuntimeShape(peek(0), &shape, &rank)) {
+                runtimeError("reshape() shape must be a number, list, or tuple of numbers");
+                return false;
+            }
+            if (tensorElementCount(rank, shape) != tensor->size) {
+                free(shape);
+                raiseException(createExceptionValue("ValueError", "reshape() size mismatch"));
+                return false;
+            }
+            result = newTensor(rank, shape, tensor->dtype, tensor->device, tensor->data);
+            free(shape);
+            if (result == NULL) {
+                runtimeError("Out of memory while reshaping tensor");
+                return false;
+            }
+            pop();
+            pop();
+            push(OBJ_VAL(result));
+            return true;
+        } else if (strcmp(name->chars, "to") == 0) {
+            ObjDevice* device;
+            ObjTensor* result;
+
+            if (argCount != 1) { runtimeError("to() takes 1 argument"); return false; }
+            device = resolveRuntimeDevice(peek(0));
+            if (device == NULL) {
+                runtimeError("to() expects a device or device name");
+                return false;
+            }
+            if (device->kind == TP_DEVICE_METAL && !tpMetalBackendIsAvailable(vm.metalBackend)) {
+                raiseException(createExceptionValue("RuntimeError", "Metal backend is unavailable"));
+                return false;
+            }
+            result = newTensor(tensor->rank, tensor->shape, tensor->dtype, device, tensor->data);
+            if (result == NULL) {
+                runtimeError("Out of memory while copying tensor");
+                return false;
+            }
+            pop();
+            pop();
+            push(OBJ_VAL(result));
+            return true;
+        } else if (strcmp(name->chars, "astype") == 0) {
+            ObjDType* dtype;
+            ObjTensor* result;
+
+            if (argCount != 1) { runtimeError("astype() takes 1 argument"); return false; }
+            dtype = resolveRuntimeDType(peek(0));
+            if (dtype == NULL) {
+                runtimeError("astype() expects a dtype or dtype name");
+                return false;
+            }
+            result = newTensor(tensor->rank, tensor->shape, dtype, tensor->device, tensor->data);
+            if (result == NULL) {
+                runtimeError("Out of memory while casting tensor");
+                return false;
+            }
+            pop();
+            pop();
+            push(OBJ_VAL(result));
+            return true;
+        } else if (strcmp(name->chars, "item") == 0) {
+            if (argCount != 0) { runtimeError("item() takes 0 arguments"); return false; }
+            if (tensor->size != 1) {
+                raiseException(createExceptionValue("ValueError", "item() requires a tensor with exactly one element."));
+                return false;
+            }
+            pop();
+            push(NUMBER_VAL((double)tensor->data[0]));
+            return true;
+        } else if (strcmp(name->chars, "tolist") == 0) {
+            if (argCount != 0) { runtimeError("tolist() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_tolist", 0);
+        } else if (strcmp(name->chars, "backward") == 0) {
+            if (argCount != 0) { runtimeError("backward() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_backward", 0);
+        } else if (strcmp(name->chars, "zero_grad") == 0) {
+            if (argCount != 0) { runtimeError("zero_grad() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_zero_grad_tensor", 0);
+        } else if (strcmp(name->chars, "sum") == 0) {
+            if (argCount != 0) { runtimeError("sum() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_sum", 0);
+        } else if (strcmp(name->chars, "mean") == 0) {
+            if (argCount != 0) { runtimeError("mean() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_mean", 0);
+        } else if (strcmp(name->chars, "max") == 0) {
+            if (argCount != 0) { runtimeError("max() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_max", 0);
+        } else if (strcmp(name->chars, "matmul") == 0) {
+            if (argCount != 1) { runtimeError("matmul() takes 1 argument"); return false; }
+            return invokeGlobalNativeByName("__ml_matmul", 1);
+        } else if (strcmp(name->chars, "relu") == 0) {
+            if (argCount != 0) { runtimeError("relu() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_relu", 0);
+        } else if (strcmp(name->chars, "sigmoid") == 0) {
+            if (argCount != 0) { runtimeError("sigmoid() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_sigmoid", 0);
+        } else if (strcmp(name->chars, "tanh") == 0) {
+            if (argCount != 0) { runtimeError("tanh() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_tanh", 0);
+        } else if (strcmp(name->chars, "gelu") == 0) {
+            if (argCount != 0) { runtimeError("gelu() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_gelu", 0);
+        } else if (strcmp(name->chars, "softmax") == 0) {
+            if (argCount != 0) { runtimeError("softmax() takes 0 arguments"); return false; }
+            return invokeGlobalNativeByName("__ml_softmax", 0);
+        } else if (strcmp(name->chars, "layernorm") == 0) {
+            if (argCount > 1) { runtimeError("layernorm() takes at most 1 argument"); return false; }
+            return invokeGlobalNativeByName("__ml_layernorm", argCount);
         }
     } else if (IS_STRING(receiver)) {
         ObjString* string = AS_STRING(receiver);
@@ -2327,7 +2600,11 @@ static bool invoke(ObjString* name, int argCount) {
     Value receiver = peek(argCount);
 
     if (!IS_INSTANCE(receiver)) {
-        return invokeBuiltinMethod(receiver, name, argCount);
+        bool ok;
+        vm.gcPauseDepth++;
+        ok = invokeBuiltinMethod(receiver, name, argCount);
+        vm.gcPauseDepth--;
+        return ok;
     }
 
     ObjInstance* instance = AS_INSTANCE(receiver);
@@ -2526,7 +2803,7 @@ static bool invokeExpandedKeyword(ObjString* name, int posCount, int kwSourceCou
 
 static bool bindMethod(ObjClass* klass, ObjString* name) {
     Value method;
-    if (!tableGet(&klass->methods, OBJ_VAL(name), &method)) {
+    if (!lookupMethodInClassChain(klass, name, &method)) {
         raiseException(createExceptionValue("AttributeError", "Undefined property."));
         return false;
     }
@@ -2535,6 +2812,17 @@ static bool bindMethod(ObjClass* klass, ObjString* name) {
     pop();
     push(OBJ_VAL(bound));
     return true;
+}
+
+static bool lookupMethodInClassChain(ObjClass* klass, ObjString* name, Value* method) {
+    ObjClass* current = klass;
+    while (current != NULL) {
+        if (tableGet(&current->methods, OBJ_VAL(name), method)) {
+            return true;
+        }
+        current = current->superClass;
+    }
+    return false;
 }
 
 static Value importModuleValue(ObjString* moduleName) {
@@ -2692,6 +2980,48 @@ static InterpretResult run() {
             case OP_SET_GLOBAL: {
                 ObjString* name = AS_STRING(READ_CONSTANT());
                 environmentSetLocal(frame->env, OBJ_VAL(name), peek(0));
+                break;
+            }
+            case OP_UNPACK: {
+                uint8_t count = READ_BYTE();
+                Value sequence = pop();
+                int length = -1;
+                int i;
+
+                if (IS_LIST(sequence)) {
+                    length = AS_LIST(sequence)->items.count;
+                } else if (IS_TUPLE(sequence)) {
+                    length = AS_TUPLE(sequence)->items.count;
+                } else if (IS_STRING(sequence)) {
+                    length = AS_STRING(sequence)->length;
+                } else if (IS_BYTES(sequence)) {
+                    length = AS_BYTES(sequence)->length;
+                } else {
+                    if (raiseException(createExceptionValue("TypeError", "Cannot unpack non-iterable value."))) {
+                        HANDLE_RE();
+                    }
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
+                if (length != count) {
+                    if (raiseException(createExceptionValue("ValueError", "Unpack length mismatch."))) {
+                        HANDLE_RE();
+                    }
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
+                for (i = 0; i < count; i++) {
+                    if (IS_LIST(sequence)) {
+                        push(AS_LIST(sequence)->items.values[i]);
+                    } else if (IS_TUPLE(sequence)) {
+                        push(AS_TUPLE(sequence)->items.values[i]);
+                    } else if (IS_STRING(sequence)) {
+                        char c[2] = {AS_STRING(sequence)->chars[i], '\0'};
+                        push(OBJ_VAL(copyString(c, 1)));
+                    } else {
+                        push(NUMBER_VAL((double)AS_BYTES(sequence)->bytes[i]));
+                    }
+                }
                 break;
             }
             case OP_EQUAL: {
@@ -3267,6 +3597,15 @@ static InterpretResult run() {
             case OP_METHOD:
                 defineMethod(AS_STRING(READ_CONSTANT()));
                 break;
+            case OP_INHERIT: {
+                if (!IS_CLASS(peek(0)) || !IS_CLASS(peek(1))) {
+                    runtimeError("Inheritance requires two classes.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                AS_CLASS(peek(1))->superClass = AS_CLASS(peek(0));
+                pop();
+                break;
+            }
             case OP_CALL: {
                 int argCount = READ_BYTE();
                 if (!callValue(peek(argCount), argCount)) {
@@ -3351,15 +3690,20 @@ static InterpretResult run() {
                 break;
             }
             case OP_GET_PROPERTY: {
+                ObjString* name = AS_STRING(READ_CONSTANT());
+                Value value;
                 if (!IS_INSTANCE(peek(0))) {
+                    if (getNativeObjectAttribute(peek(0), name, &value)) {
+                        pop();
+                        push(value);
+                        break;
+                    }
                     if (raiseException(createExceptionValue("AttributeError", "Only instances have properties."))) {
                         HANDLE_RE();
                     }
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 ObjInstance* instance = AS_INSTANCE(peek(0));
-                ObjString* name = AS_STRING(READ_CONSTANT());
-                Value value;
                 if (tableGet(&instance->fields, OBJ_VAL(name), &value)) {
                     pop(); // Instance
                     push(value);

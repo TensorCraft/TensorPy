@@ -10,6 +10,9 @@ FunctionType = "function"
 BuiltinFunctionType = "builtin_function_or_method"
 ModuleType = "module"
 ClassType = "type"
+TensorType = "tensor"
+DeviceType = "device"
+DTypeType = "dtype"
 
 
 def type_name(value):
@@ -42,3 +45,15 @@ def is_bytes(value):
 
 def is_module(value):
     return type(value) == ModuleType
+
+
+def is_tensor(value):
+    return type(value) == TensorType
+
+
+def is_device(value):
+    return type(value) == DeviceType
+
+
+def is_dtype(value):
+    return type(value) == DTypeType

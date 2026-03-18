@@ -80,7 +80,14 @@ typedef struct Compiler {
   int maxSlots;
 } Compiler;
 
+typedef struct ClassCompiler {
+  struct ClassCompiler* enclosing;
+  bool hasSuperclass;
+  Token superclassName;
+} ClassCompiler;
+
 Compiler *current = NULL;
+static ClassCompiler* currentClass = NULL;
 
 static Chunk *currentChunk() { return &current->function->chunk; }
 
@@ -291,6 +298,7 @@ static int resolveLocal(Compiler *compiler, Token *name);
 static uint8_t dottedPathConstant(Token* first, Token* last);
 static void importStatement(void);
 static void fromImportStatement(void);
+static void super_(bool canAssign);
 
 static bool check(TokenType type) { return parser.current.type == type; }
 
@@ -1128,6 +1136,41 @@ static void unary(bool canAssign) {
   }
 }
 
+static void super_(bool canAssign) {
+  (void)canAssign;
+  if (currentClass == NULL) {
+    error("Can't use 'super' outside of a class.");
+    return;
+  }
+  if (!currentClass->hasSuperclass) {
+    error("Can't use 'super' in a class with no superclass.");
+    return;
+  }
+
+  consume(TOKEN_LEFT_PAREN, "Expect '(' after 'super'.");
+  consume(TOKEN_RIGHT_PAREN, "Expect ')' after 'super('.");
+  consume(TOKEN_DOT, "Expect '.' after super().");
+  consume(TOKEN_IDENTIFIER, "Expect superclass method name.");
+
+  uint8_t name = identifierConstant(&parser.previous);
+  namedVariable(currentClass->superclassName, false);
+  emitBytes(OP_GET_LOCAL, 1);
+
+  if (match(TOKEN_LEFT_PAREN)) {
+    uint8_t posCount, kwCount, kwSourceCount, starConst, kwStarConst;
+    bool hasStar, hasKwStar;
+    argumentList(&posCount, &kwCount, &kwSourceCount, &hasStar, &starConst, &hasKwStar, &kwStarConst);
+    if (kwCount > 0 || hasStar || hasKwStar) {
+      error("super() calls currently support only positional arguments.");
+      return;
+    }
+    emitBytes(OP_SUPER_INVOKE, name);
+    emitByte(posCount);
+  } else {
+    emitBytes(OP_GET_SUPER, name);
+  }
+}
+
 ParseRule rules[] = {
     [TOKEN_LEFT_PAREN] = {grouping, call, PREC_CALL},
     [TOKEN_RIGHT_PAREN] = {NULL, NULL, PREC_NONE},
@@ -1178,7 +1221,7 @@ ParseRule rules[] = {
     [TOKEN_OR] = {NULL, or_, PREC_OR},
     [TOKEN_PRINT] = {NULL, NULL, PREC_NONE},
     [TOKEN_RETURN] = {NULL, NULL, PREC_NONE},
-    [TOKEN_SUPER] = {NULL, NULL, PREC_NONE},
+    [TOKEN_SUPER] = {super_, NULL, PREC_NONE},
     [TOKEN_THIS] = {NULL, NULL, PREC_NONE},
     [TOKEN_TRUE] = {literal, NULL, PREC_NONE},
     [TOKEN_VAR] = {NULL, NULL, PREC_NONE},
@@ -1335,6 +1378,73 @@ static void returnStatement() {
 static void expressionStatement() {
   expression();
   emitByte(OP_POP);
+}
+
+typedef struct {
+  Token names[255];
+  int count;
+} UnpackTargetList;
+
+static bool parseUnpackTargetElements(TokenType closing, UnpackTargetList* out) {
+  do {
+    consume(TOKEN_IDENTIFIER, "Expect variable name in unpack target.");
+    if (out->count == 255) {
+      error("Too many unpack targets.");
+      return false;
+    }
+    out->names[out->count++] = parser.previous;
+  } while (match(TOKEN_COMMA) && !check(closing));
+  return true;
+}
+
+static bool tryParseUnpackAssignment(void) {
+  Scanner savedScanner = scanner;
+  Parser savedParser = parser;
+  UnpackTargetList targets;
+  int i;
+
+  targets.count = 0;
+
+  if (check(TOKEN_LEFT_PAREN) || check(TOKEN_LEFT_BRACKET)) {
+    TokenType closing = check(TOKEN_LEFT_PAREN) ? TOKEN_RIGHT_PAREN : TOKEN_RIGHT_BRACKET;
+    advance();
+    if (!parseUnpackTargetElements(closing, &targets)) {
+      scanner = savedScanner;
+      parser = savedParser;
+      return false;
+    }
+    if (targets.count < 2 || !match(closing) || !match(TOKEN_EQUAL)) {
+      scanner = savedScanner;
+      parser = savedParser;
+      return false;
+    }
+  } else if (check(TOKEN_IDENTIFIER)) {
+    advance();
+    targets.names[targets.count++] = parser.previous;
+    if (!match(TOKEN_COMMA)) {
+      scanner = savedScanner;
+      parser = savedParser;
+      return false;
+    }
+    do {
+      consume(TOKEN_IDENTIFIER, "Expect variable name in unpack target.");
+      targets.names[targets.count++] = parser.previous;
+    } while (match(TOKEN_COMMA));
+    if (!match(TOKEN_EQUAL)) {
+      scanner = savedScanner;
+      parser = savedParser;
+      return false;
+    }
+  } else {
+    return false;
+  }
+
+  expression();
+  emitBytes(OP_UNPACK, (uint8_t)targets.count);
+  for (i = targets.count - 1; i >= 0; i--) {
+    storeName(targets.names[i]);
+  }
+  return true;
 }
 
 static void delStatement() {
@@ -1553,6 +1663,8 @@ static void simpleStatement() {
     importStatement();
   } else if (match(TOKEN_FROM)) {
     fromImportStatement();
+  } else if (tryParseUnpackAssignment()) {
+    return;
   } else {
     expressionStatement();
   }
@@ -1707,15 +1819,31 @@ static void method() {
 }
 
 static void classDeclaration() {
+  ClassCompiler classCompiler;
   consume(TOKEN_IDENTIFIER, "Expect class name.");
   Token className = parser.previous;
   uint8_t nameConstant = makeConstant(
       OBJ_VAL(copyString(parser.previous.start, parser.previous.length)));
 
+  classCompiler.enclosing = currentClass;
+  classCompiler.hasSuperclass = false;
+  currentClass = &classCompiler;
+
   emitBytes(OP_CLASS, nameConstant);
   emitBytes(OP_DEFINE_GLOBAL, nameConstant);
 
   namedVariable(className, false); // Push class back on stack to attach methods
+
+  if (match(TOKEN_LEFT_PAREN)) {
+    Token superName;
+    consume(TOKEN_IDENTIFIER, "Expect superclass name.");
+    superName = parser.previous;
+    consume(TOKEN_RIGHT_PAREN, "Expect ')' after superclass name.");
+    classCompiler.hasSuperclass = true;
+    classCompiler.superclassName = superName;
+    namedVariable(superName, false);
+    emitByte(OP_INHERIT);
+  }
 
   consume(TOKEN_COLON, "Expect ':' after class name.");
   consume(TOKEN_NEWLINE, "Expect newline after class declaration.");
@@ -1734,6 +1862,7 @@ static void classDeclaration() {
 
   consume(TOKEN_DEDENT, "Expect dedent after class block.");
   emitByte(OP_POP); // Pop the class object
+  currentClass = classCompiler.enclosing;
 }
 
 static void declaration() {

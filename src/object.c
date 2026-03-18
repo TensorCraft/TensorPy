@@ -42,6 +42,46 @@ static ObjString* allocateString(char* chars, int length, uint32_t hash) {
     return string;
 }
 
+int tensorElementCount(int rank, const int* shape) {
+    int size = 1;
+    int i;
+
+    if (rank < 0) {
+        return -1;
+    }
+    if (rank == 0) {
+        return 1;
+    }
+
+    for (i = 0; i < rank; i++) {
+        if (shape == NULL || shape[i] < 0) {
+            return -1;
+        }
+        size *= shape[i];
+    }
+    return size;
+}
+
+static ObjList* makeIntList(const int* values, int count) {
+    ObjList* list = newList();
+    int i;
+
+    for (i = 0; i < count; i++) {
+        writeValueArray(&list->items, NUMBER_VAL((double)values[i]));
+    }
+    return list;
+}
+
+static void fillTensorStrides(const ObjTensor* tensor, int* outStrides) {
+    int stride = 1;
+    int i;
+
+    for (i = tensor->rank - 1; i >= 0; i--) {
+        outStrides[i] = stride;
+        stride *= tensor->shape[i];
+    }
+}
+
 static void freeObject(Obj* object) {
     switch (object->type) {
         case OBJ_STRING:
@@ -89,6 +129,16 @@ static void freeObject(Obj* object) {
         case OBJ_BYTES:
             free(((ObjBytes*)object)->bytes);
             break;
+        case OBJ_DEVICE:
+        case OBJ_DTYPE:
+            break;
+        case OBJ_TENSOR: {
+            ObjTensor* tensor = (ObjTensor*)object;
+            tpMetalBufferDestroy(tensor->metalBuffer);
+            free(tensor->shape);
+            free(tensor->data);
+            break;
+        }
         case OBJ_CLASS:
             freeTable(&((ObjClass*)object)->methods);
             break;
@@ -231,6 +281,95 @@ ObjTuple* newTuple() {
     return tuple;
 }
 
+ObjDevice* newDevice(ObjString* name, TPDeviceKind kind) {
+    ObjDevice* device = ALLOCATE_OBJ(ObjDevice, OBJ_DEVICE);
+    device->kind = kind;
+    device->name = name;
+    return device;
+}
+
+ObjDType* newDType(ObjString* name, TPDTypeKind kind) {
+    ObjDType* dtype = ALLOCATE_OBJ(ObjDType, OBJ_DTYPE);
+    dtype->kind = kind;
+    dtype->name = name;
+    return dtype;
+}
+
+ObjTensor* newTensor(int rank,
+                     const int* shape,
+                     ObjDType* dtype,
+                     ObjDevice* device,
+                     const float* source) {
+    ObjTensor* tensor;
+    int size;
+    int* shapeCopy = NULL;
+    float* dataCopy = NULL;
+    TPMetalBuffer* metalBuffer = NULL;
+
+    if (dtype == NULL || device == NULL) {
+        return NULL;
+    }
+
+    size = tensorElementCount(rank, shape);
+    if (size < 0) {
+        return NULL;
+    }
+
+    if (rank > 0) {
+        shapeCopy = (int*)malloc(sizeof(int) * (size_t)rank);
+        if (shapeCopy == NULL) {
+            return NULL;
+        }
+        memcpy(shapeCopy, shape, sizeof(int) * (size_t)rank);
+    }
+
+    if (size > 0) {
+        dataCopy = (float*)malloc(sizeof(float) * (size_t)size);
+        if (dataCopy == NULL) {
+            free(shapeCopy);
+            return NULL;
+        }
+        if (source != NULL) {
+            memcpy(dataCopy, source, sizeof(float) * (size_t)size);
+        } else {
+            memset(dataCopy, 0, sizeof(float) * (size_t)size);
+        }
+    }
+
+    if (device->kind == TP_DEVICE_METAL) {
+        if (vm.metalBackend == NULL || !tpMetalBackendIsAvailable(vm.metalBackend)) {
+            free(shapeCopy);
+            free(dataCopy);
+            return NULL;
+        }
+        metalBuffer = tpMetalBufferCreate(vm.metalBackend,
+                                          sizeof(float) * (size_t)(size > 0 ? size : 1),
+                                          dataCopy);
+        if (metalBuffer == NULL) {
+            free(shapeCopy);
+            free(dataCopy);
+            return NULL;
+        }
+    }
+
+    tensor = ALLOCATE_OBJ(ObjTensor, OBJ_TENSOR);
+    tensor->rank = rank;
+    tensor->size = size;
+    tensor->dtype = dtype;
+    tensor->device = device;
+    tensor->contiguous = true;
+    tensor->shape = shapeCopy;
+    tensor->data = dataCopy;
+    tensor->metalBuffer = metalBuffer;
+    tensor->requiresGrad = false;
+    tensor->grad = NULL;
+    tensor->parentA = NULL;
+    tensor->parentB = NULL;
+    tensor->gradOp = TP_AUTOGRAD_NONE;
+    tensor->gradAux = 0.0f;
+    return tensor;
+}
+
 ObjClass* newClass(ObjString* name) {
     ObjClass* klass = ALLOCATE_OBJ(ObjClass, OBJ_CLASS);
     klass->name = name;
@@ -292,6 +431,138 @@ int sweepUnmarkedObjects(void) {
 
 int countObjects(void) {
     return (int)vm.objectCount;
+}
+
+bool getNativeObjectAttribute(Value object, ObjString* name, Value* result) {
+    if (result == NULL || !IS_OBJ(object)) {
+        return false;
+    }
+
+    if (IS_DEVICE(object)) {
+        ObjDevice* device = AS_DEVICE(object);
+        if (strcmp(name->chars, "name") == 0) {
+            *result = OBJ_VAL(device->name);
+            return true;
+        }
+        if (strcmp(name->chars, "kind") == 0) {
+            *result = OBJ_VAL(device->name);
+            return true;
+        }
+        return false;
+    }
+
+    if (IS_DTYPE(object)) {
+        ObjDType* dtype = AS_DTYPE(object);
+        if (strcmp(name->chars, "name") == 0) {
+            *result = OBJ_VAL(dtype->name);
+            return true;
+        }
+        return false;
+    }
+
+    if (IS_TENSOR(object)) {
+        ObjTensor* tensor = AS_TENSOR(object);
+        if (strcmp(name->chars, "shape") == 0) {
+            *result = OBJ_VAL(makeIntList(tensor->shape, tensor->rank));
+            return true;
+        }
+        if (strcmp(name->chars, "rank") == 0) {
+            *result = NUMBER_VAL((double)tensor->rank);
+            return true;
+        }
+        if (strcmp(name->chars, "size") == 0) {
+            *result = NUMBER_VAL((double)tensor->size);
+            return true;
+        }
+        if (strcmp(name->chars, "dtype") == 0) {
+            *result = OBJ_VAL(tensor->dtype);
+            return true;
+        }
+        if (strcmp(name->chars, "device") == 0) {
+            *result = OBJ_VAL(tensor->device);
+            return true;
+        }
+        if (strcmp(name->chars, "contiguous") == 0) {
+            *result = BOOL_VAL(tensor->contiguous);
+            return true;
+        }
+        if (strcmp(name->chars, "requires_grad") == 0) {
+            *result = BOOL_VAL(tensor->requiresGrad);
+            return true;
+        }
+        if (strcmp(name->chars, "grad") == 0) {
+            *result = tensor->grad != NULL ? OBJ_VAL(tensor->grad) : NIL_VAL;
+            return true;
+        }
+        if (strcmp(name->chars, "strides") == 0) {
+            int* strides;
+            ObjList* list;
+
+            if (tensor->rank == 0) {
+                *result = OBJ_VAL(newList());
+                return true;
+            }
+
+            strides = (int*)malloc(sizeof(int) * (size_t)tensor->rank);
+            if (strides == NULL) {
+                return false;
+            }
+            fillTensorStrides(tensor, strides);
+            list = makeIntList(strides, tensor->rank);
+            free(strides);
+            *result = OBJ_VAL(list);
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+void appendNativeObjectDirEntries(ObjList* out, Value object) {
+    if (out == NULL || !IS_OBJ(object)) {
+        return;
+    }
+
+    if (IS_DEVICE(object)) {
+        writeValueArray(&out->items, OBJ_VAL(copyString("name", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("kind", 4)));
+        return;
+    }
+
+    if (IS_DTYPE(object)) {
+        writeValueArray(&out->items, OBJ_VAL(copyString("name", 4)));
+        return;
+    }
+
+    if (IS_TENSOR(object)) {
+        writeValueArray(&out->items, OBJ_VAL(copyString("shape", 5)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("rank", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("size", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("dtype", 5)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("device", 6)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("contiguous", 10)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("requires_grad", 13)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("grad", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("strides", 7)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("reshape", 7)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("to", 2)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("astype", 6)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("item", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("tolist", 6)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("backward", 8)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("zero_grad", 9)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("sum", 3)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("mean", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("max", 3)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("matmul", 6)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("relu", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("tanh", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("sigmoid", 7)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("gelu", 4)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("softmax", 7)));
+        writeValueArray(&out->items, OBJ_VAL(copyString("layernorm", 9)));
+    }
 }
 
 void printObject(Value value) {
@@ -418,6 +689,42 @@ void printObject(Value value) {
         case OBJ_ITERATOR:
             printf("<iterator>");
             break;
+        case OBJ_DEVICE:
+            printf("%s", AS_DEVICE(value)->name->chars);
+            break;
+        case OBJ_DTYPE:
+            printf("%s", AS_DTYPE(value)->name->chars);
+            break;
+        case OBJ_TENSOR: {
+            ObjTensor* tensor = AS_TENSOR(value);
+            int limit = tensor->size < 8 ? tensor->size : 8;
+            int i;
+            printf("tensor(shape=[");
+            for (i = 0; i < tensor->rank; i++) {
+                printf("%d", tensor->shape[i]);
+                if (i < tensor->rank - 1) {
+                    printf(", ");
+                }
+            }
+            printf("], dtype=%s, device=%s",
+                   tensor->dtype->name->chars,
+                   tensor->device->name->chars);
+            if (tensor->requiresGrad) {
+                printf(", requires_grad=True");
+            }
+            printf(", data=[");
+            for (i = 0; i < limit; i++) {
+                printf("%g", tensor->data[i]);
+                if (i < limit - 1) {
+                    printf(", ");
+                }
+            }
+            if (tensor->size > limit) {
+                printf(", ...");
+            }
+            printf("])");
+            break;
+        }
         default:
             printf("<unknown obj>");
             break;

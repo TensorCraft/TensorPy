@@ -43,9 +43,11 @@ This project is still in an active build-out phase. The goal right now is practi
   - `config`
   - `host`
   - `array`
+  - `ml` (builtin module)
   - `types`
   - `inspect`
 - Platform-facing runtime operations are routed through a portability layer in `src/platform.c`
+- CPU remains the default execution device for compatibility; Metal is explicit opt-in
 
 ## Milestone Status
 
@@ -72,7 +74,16 @@ This project is still in an active build-out phase. The goal right now is practi
   - object finalization and VM teardown now free heap-owned buffers and objects
   - an explicit mark-and-sweep collector now reclaims unreachable heap objects
   - a conservative automatic GC trigger now runs from object allocation thresholds
-  - next step: return to language and compatibility work on top of the stabilized runtime
+  - next step: ML runtime work on top of the stabilized runtime
+- `Phase 5`: in progress
+  - runtime concurrency foundation is in place via thread, mutex, condvar, atomics, thread pool, and `parallel_for`
+  - CPU compute infrastructure now includes scalar, SIMD, and threaded paths for core float32 kernels
+  - a native ML object model now exists with `tensor`, `dtype`, and `device`
+  - the builtin `ml` module now provides eager tensor creation, reshape/cast/device transfer, elementwise ops, reductions, activations, and `matmul`
+  - CPU-side autograd is now available for a training-ready subset: `Parameter`, `mse_loss`, `backward()`, `zero_grad`, and `sgd_step`
+  - CPU is the default device; `metal` must be selected explicitly
+  - Apple Silicon Metal backend is wired in for explicit `metal` tensors with CPU fallback for unsupported or conservative paths
+  - next step: stabilize more CPU training primitives, then expand true Metal kernel coverage for high-value ops such as `matmul`, reductions, `softmax`, and `layernorm`
 
 ## Implemented Library Surface
 
@@ -155,8 +166,30 @@ The V1 utility modules also include:
 - `config.load`, `config.loads`, `config.get`, `config.require`, `config.merge`
 - `host.set`, `host.get`, `host.has`, `host.call`
 - `array.zeros`, `array.full`, `array.shape`, `array.add`, `array.mul`, `array.matmul`
+- `ml.metal_available()`
+- `ml.device(name)`, `ml.dtype(name)`
+- `ml.tensor(data, dtype=None, device=None)`
+- `ml.Parameter(data, dtype=None, device=None)`
+- `ml.zeros(shape, dtype=None, device=None)`
+- `ml.ones(shape, dtype=None, device=None)`
+- `ml.full(shape, value, dtype=None, device=None)`
+- `ml.arange(start, stop=None, step=None)`
+- `ml.reshape(tensor, shape)`, `ml.cast(tensor, dtype)`
+- `ml.add/sub/mul/div`, `ml.sum/mean/max`, `ml.matmul`
+- `ml.relu`, `ml.sigmoid`, `ml.gelu`, `ml.softmax`, `ml.layernorm`
+- `ml.mse_loss(pred, target)`
+- `ml.backward(tensor)`, `ml.zero_grad(params)`, `ml.sgd_step(params, lr)`
 - `types.type_name` plus basic `is_*` helpers
 - `inspect.type_name`, `inspect.is_callable`, `inspect.is_function`, `inspect.is_class`, `inspect.is_module`
+
+Tensor objects currently expose:
+
+- `.shape`, `.rank`, `.size`, `.dtype`, `.device`, `.contiguous`, `.strides`
+- `.requires_grad`, `.grad`
+- `.reshape(...)`, `.to(...)`, `.astype(...)`
+- `.item()`, `.backward()`, `.zero_grad()`
+- `.sum()`, `.mean()`, `.max()`, `.matmul(...)`
+- `.relu()`, `.sigmoid()`, `.gelu()`, `.softmax()`, `.layernorm()`
 
 The `re` module currently supports a useful regex subset:
 
@@ -247,6 +280,46 @@ In the REPL, expression-like input is automatically echoed:
 > x = 7
 > x
 7
+```
+
+### ML Runtime
+
+```python
+import ml
+
+x = ml.tensor([[1, 2], [3, 4]])
+print(x.shape)          # [2, 2]
+print(ml.add(x, x).sum())
+
+# CPU is still the default
+print(ml.ones(4).device.name)   # cpu
+
+# Metal is explicit opt-in
+if ml.metal_available():
+    y = ml.ones(4, ml.float32, ml.metal)
+    print(y.device.name)        # metal
+    print(ml.mul(y, 3).sum())
+```
+
+### CPU Training Loop
+
+```python
+import ml
+
+x = ml.tensor([[1], [2], [3], [4]])
+y = ml.tensor([[3], [5], [7], [9]])
+
+w = ml.Parameter([[0]])
+b = ml.Parameter([0])
+
+for _ in range(200):
+    ml.zero_grad([w, b])
+    pred = ml.add(ml.matmul(x, w), b)
+    loss = ml.mse_loss(pred, y)
+    loss.backward()
+    ml.sgd_step([w, b], 0.05)
+
+print(w.item(), b.item())
 ```
 
 ## Examples

@@ -5,10 +5,53 @@
 #include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "tensorpy/platform.h"
+
+typedef struct PlatformTaskState {
+    PlatformAtomicInt refCount;
+    PlatformMutex mutex;
+    PlatformCondVar cond;
+    bool completed;
+} PlatformTaskState;
+
+typedef struct {
+    PlatformTaskFunction function;
+    void* context;
+    PlatformTaskState* state;
+} PlatformQueuedTask;
+
+struct PlatformThreadPool {
+    PlatformMutex mutex;
+    PlatformCondVar cond;
+    PlatformCondVar idleCond;
+    PlatformThread* threads;
+    int threadCount;
+    PlatformQueuedTask* queue;
+    int queueCapacity;
+    int queueHead;
+    int queueTail;
+    int queueCount;
+    int activeCount;
+    bool shuttingDown;
+    char lastError[128];
+};
+
+typedef struct {
+    PlatformParallelForFunction function;
+    void* context;
+    PlatformEvent done;
+    PlatformAtomicInt remaining;
+} PlatformParallelForState;
+
+typedef struct {
+    PlatformParallelForState* state;
+    int start;
+    int end;
+} PlatformParallelForTask;
 
 static char* duplicateString(const char* source) {
     size_t length;
@@ -26,6 +69,187 @@ static char* duplicateString(const char* source) {
 
     memcpy(copy, source, length + 1);
     return copy;
+}
+
+static void platformWriteLastError(PlatformThreadPool* pool, const char* message) {
+    size_t length;
+
+    if (pool == NULL || message == NULL) {
+        return;
+    }
+
+    length = strlen(message);
+    if (length >= sizeof(pool->lastError)) {
+        length = sizeof(pool->lastError) - 1;
+    }
+    memcpy(pool->lastError, message, length);
+    pool->lastError[length] = '\0';
+}
+
+static bool platformTaskStateCreate(PlatformTaskState** outState) {
+    PlatformTaskState* state;
+
+    if (outState == NULL) {
+        return false;
+    }
+
+    state = (PlatformTaskState*)malloc(sizeof(PlatformTaskState));
+    if (state == NULL) {
+        return false;
+    }
+
+    platformAtomicInit(&state->refCount, 1);
+    state->completed = false;
+    if (!platformMutexInit(&state->mutex) || !platformCondVarInit(&state->cond)) {
+        platformCondVarDestroy(&state->cond);
+        platformMutexDestroy(&state->mutex);
+        free(state);
+        return false;
+    }
+
+    *outState = state;
+    return true;
+}
+
+static void platformTaskStateRetain(PlatformTaskState* state) {
+    if (state != NULL) {
+        platformAtomicFetchAdd(&state->refCount, 1);
+    }
+}
+
+static void platformTaskStateRelease(PlatformTaskState* state) {
+    if (state == NULL) {
+        return;
+    }
+
+    if (platformAtomicFetchSub(&state->refCount, 1) == 1) {
+        platformCondVarDestroy(&state->cond);
+        platformMutexDestroy(&state->mutex);
+        free(state);
+    }
+}
+
+static void platformTaskStateComplete(PlatformTaskState* state) {
+    if (state == NULL) {
+        return;
+    }
+
+    platformMutexLock(&state->mutex);
+    state->completed = true;
+    platformCondVarBroadcast(&state->cond);
+    platformMutexUnlock(&state->mutex);
+}
+
+static void platformTaskStateWait(PlatformTaskState* state) {
+    if (state == NULL) {
+        return;
+    }
+
+    platformMutexLock(&state->mutex);
+    while (!state->completed) {
+        platformCondVarWait(&state->cond, &state->mutex);
+    }
+    platformMutexUnlock(&state->mutex);
+}
+
+static bool platformThreadPoolQueueGrow(PlatformThreadPool* pool) {
+    PlatformQueuedTask* grown;
+    int i;
+    int newCapacity;
+
+    if (pool == NULL) {
+        return false;
+    }
+
+    newCapacity = pool->queueCapacity < 16 ? 16 : pool->queueCapacity * 2;
+    grown = (PlatformQueuedTask*)malloc(sizeof(PlatformQueuedTask) * newCapacity);
+    if (grown == NULL) {
+        platformWriteLastError(pool, "failed to grow task queue");
+        return false;
+    }
+
+    for (i = 0; i < pool->queueCount; i++) {
+        grown[i] = pool->queue[(pool->queueHead + i) % pool->queueCapacity];
+    }
+
+    free(pool->queue);
+    pool->queue = grown;
+    pool->queueCapacity = newCapacity;
+    pool->queueHead = 0;
+    pool->queueTail = pool->queueCount;
+    return true;
+}
+
+static bool platformThreadPoolQueuePush(PlatformThreadPool* pool,
+                                        PlatformTaskFunction function,
+                                        void* context,
+                                        PlatformTaskState* state) {
+    if (pool->queueCount == pool->queueCapacity && !platformThreadPoolQueueGrow(pool)) {
+        return false;
+    }
+
+    pool->queue[pool->queueTail].function = function;
+    pool->queue[pool->queueTail].context = context;
+    pool->queue[pool->queueTail].state = state;
+    pool->queueTail = (pool->queueTail + 1) % pool->queueCapacity;
+    pool->queueCount++;
+    return true;
+}
+
+static bool platformThreadPoolQueuePop(PlatformThreadPool* pool, PlatformQueuedTask* outTask) {
+    if (pool == NULL || outTask == NULL || pool->queueCount == 0) {
+        return false;
+    }
+
+    *outTask = pool->queue[pool->queueHead];
+    pool->queueHead = (pool->queueHead + 1) % pool->queueCapacity;
+    pool->queueCount--;
+    return true;
+}
+
+static void* platformThreadPoolWorker(void* context) {
+    PlatformThreadPool* pool = (PlatformThreadPool*)context;
+
+    for (;;) {
+        PlatformQueuedTask task;
+
+        platformMutexLock(&pool->mutex);
+        while (!pool->shuttingDown && pool->queueCount == 0) {
+            platformCondVarWait(&pool->cond, &pool->mutex);
+        }
+
+        if (pool->shuttingDown && pool->queueCount == 0) {
+            platformMutexUnlock(&pool->mutex);
+            return NULL;
+        }
+
+        if (!platformThreadPoolQueuePop(pool, &task)) {
+            platformMutexUnlock(&pool->mutex);
+            continue;
+        }
+        pool->activeCount++;
+        platformMutexUnlock(&pool->mutex);
+
+        task.function(task.context);
+        platformTaskStateComplete(task.state);
+        platformTaskStateRelease(task.state);
+
+        platformMutexLock(&pool->mutex);
+        pool->activeCount--;
+        if (pool->queueCount == 0 && pool->activeCount == 0) {
+            platformCondVarBroadcast(&pool->idleCond);
+        }
+        platformMutexUnlock(&pool->mutex);
+    }
+}
+
+static void platformParallelForRunRange(void* context) {
+    PlatformParallelForTask* task = (PlatformParallelForTask*)context;
+    task->state->function(task->start, task->end, task->state->context);
+    if (platformAtomicFetchSub(&task->state->remaining, 1) == 1) {
+        platformEventSignal(&task->state->done);
+    }
+    free(task);
 }
 
 char* platformReadTextFile(const char* path) {
@@ -370,4 +594,510 @@ bool platformRenamePath(const char* from, const char* to) {
 
 const char* platformName(void) {
     return "macos-darwin";
+}
+
+int platformHardwareThreadCount(void) {
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (count < 1) {
+        return 1;
+    }
+    if (count > 1024) {
+        return 1024;
+    }
+    return (int)count;
+}
+
+bool platformThreadCreate(PlatformThread* thread,
+                          PlatformThreadFunction function,
+                          void* context) {
+    if (thread == NULL || function == NULL) {
+        return false;
+    }
+
+    thread->started = false;
+    if (pthread_create(&thread->handle, NULL, function, context) != 0) {
+        return false;
+    }
+    thread->started = true;
+    return true;
+}
+
+bool platformThreadJoin(PlatformThread* thread, void** result) {
+    if (thread == NULL || !thread->started) {
+        return false;
+    }
+
+    if (pthread_join(thread->handle, result) != 0) {
+        return false;
+    }
+
+    thread->started = false;
+    return true;
+}
+
+bool platformThreadDetach(PlatformThread* thread) {
+    if (thread == NULL || !thread->started) {
+        return false;
+    }
+
+    if (pthread_detach(thread->handle) != 0) {
+        return false;
+    }
+
+    thread->started = false;
+    return true;
+}
+
+uint64_t platformThreadCurrentId(void) {
+    return (uint64_t)(uintptr_t)pthread_self();
+}
+
+bool platformMutexInit(PlatformMutex* mutex) {
+    if (mutex == NULL) {
+        return false;
+    }
+
+    mutex->initialized = false;
+    if (pthread_mutex_init(&mutex->handle, NULL) != 0) {
+        return false;
+    }
+    mutex->initialized = true;
+    return true;
+}
+
+void platformMutexDestroy(PlatformMutex* mutex) {
+    if (mutex == NULL || !mutex->initialized) {
+        return;
+    }
+    pthread_mutex_destroy(&mutex->handle);
+    mutex->initialized = false;
+}
+
+void platformMutexLock(PlatformMutex* mutex) {
+    if (mutex != NULL && mutex->initialized) {
+        pthread_mutex_lock(&mutex->handle);
+    }
+}
+
+void platformMutexUnlock(PlatformMutex* mutex) {
+    if (mutex != NULL && mutex->initialized) {
+        pthread_mutex_unlock(&mutex->handle);
+    }
+}
+
+bool platformCondVarInit(PlatformCondVar* cond) {
+    if (cond == NULL) {
+        return false;
+    }
+
+    cond->initialized = false;
+    if (pthread_cond_init(&cond->handle, NULL) != 0) {
+        return false;
+    }
+    cond->initialized = true;
+    return true;
+}
+
+void platformCondVarDestroy(PlatformCondVar* cond) {
+    if (cond == NULL || !cond->initialized) {
+        return;
+    }
+    pthread_cond_destroy(&cond->handle);
+    cond->initialized = false;
+}
+
+void platformCondVarWait(PlatformCondVar* cond, PlatformMutex* mutex) {
+    if (cond == NULL || mutex == NULL || !cond->initialized || !mutex->initialized) {
+        return;
+    }
+    pthread_cond_wait(&cond->handle, &mutex->handle);
+}
+
+void platformCondVarSignal(PlatformCondVar* cond) {
+    if (cond != NULL && cond->initialized) {
+        pthread_cond_signal(&cond->handle);
+    }
+}
+
+void platformCondVarBroadcast(PlatformCondVar* cond) {
+    if (cond != NULL && cond->initialized) {
+        pthread_cond_broadcast(&cond->handle);
+    }
+}
+
+void platformAtomicInit(PlatformAtomicInt* value, int64_t initialValue) {
+    if (value != NULL) {
+        atomic_init(&value->value, initialValue);
+    }
+}
+
+int64_t platformAtomicLoad(const PlatformAtomicInt* value) {
+    if (value == NULL) {
+        return 0;
+    }
+    return atomic_load(&((PlatformAtomicInt*)value)->value);
+}
+
+void platformAtomicStore(PlatformAtomicInt* value, int64_t newValue) {
+    if (value != NULL) {
+        atomic_store(&value->value, newValue);
+    }
+}
+
+int64_t platformAtomicFetchAdd(PlatformAtomicInt* value, int64_t delta) {
+    if (value == NULL) {
+        return 0;
+    }
+    return atomic_fetch_add(&value->value, delta);
+}
+
+int64_t platformAtomicFetchSub(PlatformAtomicInt* value, int64_t delta) {
+    if (value == NULL) {
+        return 0;
+    }
+    return atomic_fetch_sub(&value->value, delta);
+}
+
+bool platformAtomicCompareExchange(PlatformAtomicInt* value,
+                                   int64_t* expected,
+                                   int64_t desired) {
+    if (value == NULL || expected == NULL) {
+        return false;
+    }
+    return atomic_compare_exchange_strong(&value->value, expected, desired);
+}
+
+bool platformEventInit(PlatformEvent* event, bool signaled) {
+    if (event == NULL) {
+        return false;
+    }
+
+    if (!platformMutexInit(&event->mutex)) {
+        return false;
+    }
+    if (!platformCondVarInit(&event->cond)) {
+        platformMutexDestroy(&event->mutex);
+        return false;
+    }
+    event->signaled = signaled;
+    return true;
+}
+
+void platformEventDestroy(PlatformEvent* event) {
+    if (event == NULL) {
+        return;
+    }
+    platformCondVarDestroy(&event->cond);
+    platformMutexDestroy(&event->mutex);
+}
+
+void platformEventWait(PlatformEvent* event) {
+    if (event == NULL) {
+        return;
+    }
+
+    platformMutexLock(&event->mutex);
+    while (!event->signaled) {
+        platformCondVarWait(&event->cond, &event->mutex);
+    }
+    platformMutexUnlock(&event->mutex);
+}
+
+void platformEventSignal(PlatformEvent* event) {
+    if (event == NULL) {
+        return;
+    }
+
+    platformMutexLock(&event->mutex);
+    event->signaled = true;
+    platformCondVarBroadcast(&event->cond);
+    platformMutexUnlock(&event->mutex);
+}
+
+void platformEventReset(PlatformEvent* event) {
+    if (event == NULL) {
+        return;
+    }
+
+    platformMutexLock(&event->mutex);
+    event->signaled = false;
+    platformMutexUnlock(&event->mutex);
+}
+
+PlatformThreadPool* platformThreadPoolCreate(int threadCount) {
+    PlatformThreadPool* pool;
+    int i;
+
+    if (threadCount <= 0) {
+        threadCount = platformHardwareThreadCount();
+    }
+
+    pool = (PlatformThreadPool*)calloc(1, sizeof(PlatformThreadPool));
+    if (pool == NULL) {
+        return NULL;
+    }
+
+    if (!platformMutexInit(&pool->mutex) ||
+        !platformCondVarInit(&pool->cond) ||
+        !platformCondVarInit(&pool->idleCond)) {
+        platformThreadPoolDestroy(pool);
+        return NULL;
+    }
+
+    pool->queueCapacity = threadCount * 4;
+    if (pool->queueCapacity < 16) {
+        pool->queueCapacity = 16;
+    }
+
+    pool->queue = (PlatformQueuedTask*)calloc((size_t)pool->queueCapacity, sizeof(PlatformQueuedTask));
+    pool->threads = (PlatformThread*)calloc((size_t)threadCount, sizeof(PlatformThread));
+    if (pool->queue == NULL || pool->threads == NULL) {
+        platformWriteLastError(pool, "failed to allocate thread pool resources");
+        platformThreadPoolDestroy(pool);
+        return NULL;
+    }
+
+    pool->threadCount = threadCount;
+    pool->lastError[0] = '\0';
+    for (i = 0; i < pool->threadCount; i++) {
+        if (!platformThreadCreate(&pool->threads[i], platformThreadPoolWorker, pool)) {
+            platformWriteLastError(pool, "failed to create worker thread");
+            pool->shuttingDown = true;
+            platformCondVarBroadcast(&pool->cond);
+            while (i-- > 0) {
+                platformThreadJoin(&pool->threads[i], NULL);
+            }
+            platformThreadPoolDestroy(pool);
+            return NULL;
+        }
+    }
+
+    return pool;
+}
+
+void platformThreadPoolDestroy(PlatformThreadPool* pool) {
+    int i;
+
+    if (pool == NULL) {
+        return;
+    }
+
+    if (pool->threads != NULL) {
+        platformMutexLock(&pool->mutex);
+        pool->shuttingDown = true;
+        platformCondVarBroadcast(&pool->cond);
+        platformMutexUnlock(&pool->mutex);
+
+        for (i = 0; i < pool->threadCount; i++) {
+            if (pool->threads[i].started) {
+                platformThreadJoin(&pool->threads[i], NULL);
+            }
+        }
+    }
+
+    if (pool->queue != NULL) {
+        for (i = 0; i < pool->queueCount; i++) {
+            PlatformQueuedTask* task = &pool->queue[(pool->queueHead + i) % pool->queueCapacity];
+            platformTaskStateComplete(task->state);
+            platformTaskStateRelease(task->state);
+        }
+        free(pool->queue);
+    }
+
+    free(pool->threads);
+    platformCondVarDestroy(&pool->idleCond);
+    platformCondVarDestroy(&pool->cond);
+    platformMutexDestroy(&pool->mutex);
+    free(pool);
+}
+
+int platformThreadPoolThreadCount(PlatformThreadPool* pool) {
+    if (pool == NULL) {
+        return 0;
+    }
+    return pool->threadCount;
+}
+
+const char* platformThreadPoolLastError(PlatformThreadPool* pool) {
+    if (pool == NULL || pool->lastError[0] == '\0') {
+        return NULL;
+    }
+    return pool->lastError;
+}
+
+bool platformThreadPoolSubmit(PlatformThreadPool* pool,
+                              PlatformTaskFunction function,
+                              void* context,
+                              PlatformTaskHandle* outHandle) {
+    PlatformTaskState* state;
+
+    if (pool == NULL || function == NULL || outHandle == NULL) {
+        return false;
+    }
+
+    outHandle->state = NULL;
+    if (!platformTaskStateCreate(&state)) {
+        platformWriteLastError(pool, "failed to allocate task state");
+        return false;
+    }
+
+    platformMutexLock(&pool->mutex);
+    if (pool->shuttingDown) {
+        platformMutexUnlock(&pool->mutex);
+        platformWriteLastError(pool, "thread pool is shutting down");
+        platformTaskStateRelease(state);
+        return false;
+    }
+
+    platformTaskStateRetain(state);
+    if (!platformThreadPoolQueuePush(pool, function, context, state)) {
+        platformMutexUnlock(&pool->mutex);
+        platformTaskStateRelease(state);
+        platformTaskStateRelease(state);
+        return false;
+    }
+
+    outHandle->state = state;
+    platformCondVarSignal(&pool->cond);
+    platformMutexUnlock(&pool->mutex);
+    return true;
+}
+
+bool platformTaskHandleIsValid(const PlatformTaskHandle* handle) {
+    return handle != NULL && handle->state != NULL;
+}
+
+bool platformTaskHandleIsDone(const PlatformTaskHandle* handle) {
+    bool completed;
+
+    if (!platformTaskHandleIsValid(handle)) {
+        return true;
+    }
+
+    platformMutexLock(&handle->state->mutex);
+    completed = handle->state->completed;
+    platformMutexUnlock(&handle->state->mutex);
+    return completed;
+}
+
+void platformTaskHandleWait(PlatformTaskHandle* handle) {
+    if (!platformTaskHandleIsValid(handle)) {
+        return;
+    }
+    platformTaskStateWait(handle->state);
+}
+
+void platformTaskHandleDestroy(PlatformTaskHandle* handle) {
+    if (handle == NULL || handle->state == NULL) {
+        return;
+    }
+    platformTaskStateRelease(handle->state);
+    handle->state = NULL;
+}
+
+void platformThreadPoolWaitAll(PlatformThreadPool* pool) {
+    if (pool == NULL) {
+        return;
+    }
+
+    platformMutexLock(&pool->mutex);
+    while (pool->queueCount > 0 || pool->activeCount > 0) {
+        platformCondVarWait(&pool->idleCond, &pool->mutex);
+    }
+    platformMutexUnlock(&pool->mutex);
+}
+
+bool platformThreadPoolParallelFor(PlatformThreadPool* pool,
+                                   int start,
+                                   int end,
+                                   int grainSize,
+                                   PlatformParallelForFunction function,
+                                   void* context) {
+    PlatformParallelForState state;
+    PlatformTaskHandle* handles;
+    int taskCount;
+    int index;
+    int begin;
+
+    if (function == NULL) {
+        return false;
+    }
+
+    if (end <= start) {
+        return true;
+    }
+
+    if (pool == NULL || pool->threadCount <= 0) {
+        function(start, end, context);
+        return true;
+    }
+
+    if (grainSize <= 0) {
+        grainSize = 1;
+    }
+
+    taskCount = (end - start + grainSize - 1) / grainSize;
+    if (taskCount <= 1) {
+        function(start, end, context);
+        return true;
+    }
+
+    handles = (PlatformTaskHandle*)calloc((size_t)taskCount, sizeof(PlatformTaskHandle));
+    if (handles == NULL) {
+        platformWriteLastError(pool, "failed to allocate parallel_for handles");
+        return false;
+    }
+
+    state.function = function;
+    state.context = context;
+    if (!platformEventInit(&state.done, false)) {
+        platformWriteLastError(pool, "failed to initialize parallel_for event");
+        free(handles);
+        return false;
+    }
+    platformAtomicInit(&state.remaining, taskCount);
+
+    begin = start;
+    for (index = 0; index < taskCount; index++) {
+        PlatformParallelForTask* task = (PlatformParallelForTask*)malloc(sizeof(PlatformParallelForTask));
+        if (task == NULL) {
+            platformWriteLastError(pool, "failed to allocate parallel_for task");
+            break;
+        }
+
+        task->state = &state;
+        task->start = begin;
+        task->end = begin + grainSize;
+        if (task->end > end) {
+            task->end = end;
+        }
+        begin = task->end;
+
+        if (!platformThreadPoolSubmit(pool, platformParallelForRunRange, task, &handles[index])) {
+            free(task);
+            break;
+        }
+    }
+
+    if (index != taskCount) {
+        int j;
+        for (j = 0; j < index; j++) {
+            platformTaskHandleWait(&handles[j]);
+            platformTaskHandleDestroy(&handles[j]);
+        }
+        platformEventDestroy(&state.done);
+        free(handles);
+        return false;
+    }
+
+    platformEventWait(&state.done);
+
+    for (index = 0; index < taskCount; index++) {
+        platformTaskHandleWait(&handles[index]);
+        platformTaskHandleDestroy(&handles[index]);
+    }
+
+    platformEventDestroy(&state.done);
+    free(handles);
+    return true;
 }

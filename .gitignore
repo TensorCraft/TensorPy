@@ -1,8 +1,13 @@
 tensorpy
+compute_test
+platform_concurrency_test
 src/*.o
 
 __pycache__/
 *.pyc
+
+data/mnist/raw/
+data/mnist/*.csv
 
 release/
 progresss.md
