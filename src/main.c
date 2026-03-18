@@ -38,6 +38,8 @@ static bool isLikelyExpression(const char* line) {
     if (*line == '\0' || *line == '\n') return false;
 
     if (startsWithKeyword(line, "if") ||
+        startsWithKeyword(line, "import") ||
+        startsWithKeyword(line, "from") ||
         startsWithKeyword(line, "for") ||
         startsWithKeyword(line, "while") ||
         startsWithKeyword(line, "def") ||
@@ -85,6 +87,21 @@ static bool lineStartsBlock(const char* line) {
     return len > 0 && line[len - 1] == ':';
 }
 
+static bool isReplExitCommand(const char* line) {
+    while (*line == ' ' || *line == '\t') line++;
+
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                       line[len - 1] == ' ' || line[len - 1] == '\t')) {
+        len--;
+    }
+
+    return (len == 4 && strncmp(line, "exit", 4) == 0) ||
+           (len == 6 && strncmp(line, "exit()", 6) == 0) ||
+           (len == 4 && strncmp(line, "quit", 4) == 0) ||
+           (len == 6 && strncmp(line, "quit()", 6) == 0);
+}
+
 static void repl(TPContext* context) {
     char line[1024];
     char wrapped[1152];
@@ -118,6 +135,10 @@ static void repl(TPContext* context) {
             strncat(block, line, sizeof(block) - strlen(block) - 1);
             collecting = true;
             continue;
+        }
+
+        if (isReplExitCommand(line)) {
+            break;
         }
 
         if (isLikelyExpression(line)) {

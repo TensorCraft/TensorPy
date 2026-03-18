@@ -56,11 +56,17 @@ static void freeObject(Obj* object) {
             break;
         }
         case OBJ_CLOSURE:
-        case OBJ_NATIVE:
         case OBJ_SLICE:
         case OBJ_ITERATOR:
         case OBJ_BOUND_METHOD:
             break;
+        case OBJ_NATIVE: {
+            ObjNative* native = (ObjNative*)object;
+            if (native->freeUserData != NULL && native->userData != NULL) {
+                native->freeUserData(native->userData);
+            }
+            break;
+        }
         case OBJ_ENVIRONMENT: {
             ObjEnvironment* env = (ObjEnvironment*)object;
             if (env->ownsTable) {
@@ -186,8 +192,18 @@ ObjEnvironment* newEnvironmentWithTable(ObjEnvironment* parent, Table* table) {
 }
 
 ObjNative* newNative(NativeFn function) {
+    return newNativeWithFinalizer(function, NULL, NULL);
+}
+
+ObjNative* newNativeWithUserData(NativeFn function, void* userData) {
+    return newNativeWithFinalizer(function, userData, NULL);
+}
+
+ObjNative* newNativeWithFinalizer(NativeFn function, void* userData, NativeFreeFn freeUserData) {
     ObjNative* native = ALLOCATE_OBJ(ObjNative, OBJ_NATIVE);
     native->function = function;
+    native->userData = userData;
+    native->freeUserData = freeUserData;
     return native;
 }
 

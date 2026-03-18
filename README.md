@@ -99,6 +99,16 @@ The `json` module supports:
 - exponent numbers like `1.5e2`
 - stricter invalid-literal and invalid-escape errors
 
+The `os` module currently supports:
+
+- `os.name`
+- `os.sep`
+- `os.getcwd()`
+- `os.listdir(path=".")`
+- `os.exists(path)`
+- `os.isdir(path)`
+- `os.isfile(path)`
+
 The `re` module currently supports a useful regex subset:
 
 - `re.compile(...)`
@@ -134,7 +144,14 @@ It exposes an opaque `TPContext` plus small helpers for:
 
 - creating a context
 - interpreting source in that context
+- reading and writing simple globals as public values
+- retrieving the last runtime error as a public value
+- registering a simple host-native module with scalar values and functions
+- checking the public API / extension ABI version
 - destroying the context
+
+Module registration handles are lightweight setup helpers; the VM owns the
+registered module object after creation.
 
 This is enough to begin embedding TensorPy from C without including `vm.h` or
 other internal runtime headers. The detailed readiness notes live in:
@@ -242,13 +259,16 @@ TensorPy now has a minimal public embedding header:
 
 - [include/tensorpy/api.h](/Users/tensorcraft/Projects/TensorPy/include/tensorpy/api.h)
 
-That header is intentionally small and currently exposes only interpreter
-lifecycle and top-level code execution entry points.
+That header is intentionally small and now exposes a frozen scalar-only Phase 1
+embedding and host-extension surface.
 
 The current readiness call is:
 
-- embedding API design can begin
-- public third-party C extension ABI should wait until object/value ownership is stabilized
+- third-party C extensions can target the scalar-only ABI in `api.h`
+- public values and host-native callbacks are limited to `nil`, `bool`,
+  `number`, `string`, and typed errors
+- containers, objects, and callables are still intentionally out of scope for
+  the public ABI until ownership rules are expanded and frozen
 
 More detail is documented in:
 

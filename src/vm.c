@@ -429,6 +429,7 @@ static void markRoots(void) {
     markObject((Obj*)vm.globalEnv);
     markObject((Obj*)vm.initString);
     markObject((Obj*)vm.moduleClass);
+    markValue(vm.lastException);
     markTable(&vm.modules);
     markTable(&vm.strings);
 }
@@ -452,6 +453,7 @@ static void markRootsForCollection(void) {
     markObject((Obj*)vm.globalEnv);
     markObject((Obj*)vm.initString);
     markObject((Obj*)vm.moduleClass);
+    markValue(vm.lastException);
     markTable(&vm.modules);
 }
 
@@ -520,6 +522,7 @@ static bool raiseException(Value exception) {
     }
 
     char buffer[1024];
+    vm.lastException = exception;
     formatException(exception, buffer, sizeof(buffer));
     fprintf(stderr, "%s\n", buffer);
 
@@ -600,6 +603,9 @@ void initVM() {
     vm.nextGC = 64;
     vm.gcPauseDepth = 1;
     vm.gcEnabled = false;
+    vm.lastException = NIL_VAL;
+    vm.currentNative = NULL;
+    vm.nativeExceptionRaised = false;
     initTable(&vm.modules);
     initTable(&vm.strings);
     vm.globalEnv = newEnvironment(NULL);
@@ -630,6 +636,9 @@ void freeVM() {
     vm.globalEnv = NULL;
     vm.initString = NULL;
     vm.moduleClass = NULL;
+    vm.lastException = NIL_VAL;
+    vm.currentNative = NULL;
+    vm.nativeExceptionRaised = false;
 }
 
 void push(Value value) {
@@ -847,8 +856,19 @@ static bool callValue(Value callee, int argCount) {
                 return true;
             }
             case OBJ_NATIVE: {
-                NativeFn native = AS_NATIVE(callee);
+                ObjNative* nativeObj = (ObjNative*)AS_OBJ(callee);
+                ObjNative* previousNative = vm.currentNative;
+                bool previousNativeExceptionRaised = vm.nativeExceptionRaised;
+                NativeFn native = nativeObj->function;
+                vm.currentNative = nativeObj;
+                vm.nativeExceptionRaised = false;
                 Value result = native(argCount, vm.stackTop - argCount);
+                bool nativeFailed = vm.nativeExceptionRaised;
+                vm.currentNative = previousNative;
+                vm.nativeExceptionRaised = previousNativeExceptionRaised;
+                if (nativeFailed) {
+                    return false;
+                }
                 vm.stackTop -= argCount + 1;
                 push(result);
                 return true;
@@ -3505,5 +3525,34 @@ static InterpretResult interpretInGlobals(const char* source, const char* filena
 }
 
 InterpretResult interpret(const char* source, const char* filename) {
+    vmClearLastException();
     return interpretInGlobals(source, filename, vm.globalEnv);
+}
+
+bool vmGetGlobalValue(const char* name, Value* value) {
+    ObjString* key = copyString(name, (int)strlen(name));
+    return tableGet(vm.globalEnv->table, OBJ_VAL(key), value);
+}
+
+bool vmSetGlobalValue(const char* name, Value value) {
+    ObjString* key = copyString(name, (int)strlen(name));
+    return tableSet(vm.globalEnv->table, OBJ_VAL(key), value);
+}
+
+bool vmGetLastException(Value* value) {
+    if (IS_NIL(vm.lastException)) {
+        return false;
+    }
+
+    *value = vm.lastException;
+    return true;
+}
+
+void vmClearLastException(void) {
+    vm.lastException = NIL_VAL;
+}
+
+bool vmRaiseExceptionMessage(const char* className, const char* message) {
+    vm.nativeExceptionRaised = true;
+    return raiseException(createExceptionValue(className, message));
 }

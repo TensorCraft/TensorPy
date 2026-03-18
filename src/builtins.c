@@ -407,6 +407,46 @@ static Value platformNameNative(int argCount, Value* args) {
     return OBJ_VAL(copyString(name, (int)strlen(name)));
 }
 
+static Value platformListdirNative(int argCount, Value* args) {
+    const char* path = ".";
+    char** entries;
+    int count = 0;
+    ObjList* result;
+    int i;
+
+    if (argCount > 1) return NIL_VAL;
+    if (argCount == 1) {
+        if (!IS_STRING(args[0])) return NIL_VAL;
+        path = AS_CSTRING(args[0]);
+    }
+
+    entries = platformListDirectory(path, &count);
+    if (entries == NULL) return NIL_VAL;
+
+    result = newList();
+    for (i = 0; i < count; i++) {
+        writeValueArray(&result->items, OBJ_VAL(copyString(entries[i], (int)strlen(entries[i]))));
+    }
+
+    platformFreeDirectoryList(entries, count);
+    return OBJ_VAL(result);
+}
+
+static Value platformExistsNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
+    return BOOL_VAL(platformPathExists(AS_CSTRING(args[0])));
+}
+
+static Value platformIsdirNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
+    return BOOL_VAL(platformPathIsDirectory(AS_CSTRING(args[0])));
+}
+
+static Value platformIsfileNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
+    return BOOL_VAL(platformPathIsFile(AS_CSTRING(args[0])));
+}
+
 static Value gcMarkCountNative(int argCount, Value* args) {
     (void)args;
     if (argCount != 0) return NIL_VAL;
@@ -562,6 +602,10 @@ void registerBuiltins() {
     defineNative("__platform_random", platformRandomNative);
     defineNative("__platform_getcwd", platformGetcwdNative);
     defineNative("__platform_name", platformNameNative);
+    defineNative("__platform_listdir", platformListdirNative);
+    defineNative("__platform_exists", platformExistsNative);
+    defineNative("__platform_isdir", platformIsdirNative);
+    defineNative("__platform_isfile", platformIsfileNative);
     defineNative("__gc_mark_count", gcMarkCountNative);
     defineNative("__gc_reachable_count", gcReachableCountNative);
     defineNative("__gc_collect", gcCollectNative);

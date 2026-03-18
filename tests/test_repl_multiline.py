@@ -1,4 +1,3 @@
-def add(a, b):
-    return a + b
-
-add(1, 2)
+import math
+math.floor(3.9)
+exit
