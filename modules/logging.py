@@ -14,6 +14,10 @@ def get_level():
     return _state["level"]
 
 
+def basicConfig(level=INFO):
+    return set_level(level)
+
+
 def _emit(level_name, level_value, name, message):
     if level_value < _state["level"]:
         return None
@@ -22,6 +26,12 @@ def _emit(level_name, level_value, name, message):
     else:
         print("[" + level_name + "] " + name + ": " + str(message))
     return None
+
+
+def _format_exception(exc):
+    if hasattr(exc, "message") and exc.message != "":
+        return type(exc) + ": " + exc.message
+    return str(exc)
 
 
 def debug(message):
@@ -43,6 +53,10 @@ def error(message):
     return _emit("ERROR", ERROR, None, message)
 
 
+def exception(exc):
+    return _emit("ERROR", ERROR, None, _format_exception(exc))
+
+
 class Logger:
     def __init__(self, name):
         self.name = name
@@ -61,6 +75,9 @@ class Logger:
 
     def error(self, message):
         return _emit("ERROR", ERROR, self.name, message)
+
+    def exception(self, exc):
+        return _emit("ERROR", ERROR, self.name, _format_exception(exc))
 
 
 def getLogger(name):

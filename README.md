@@ -127,17 +127,27 @@ The `os` module currently supports:
 - `os.remove(path)`
 - `os.rmdir(path)`
 - `os.rename(src, dst)`
+- `os.replace(src, dst)`
+- `os.removedirs(path)`
+- `os.getenv(name, default=None)`
+- `os.system(command)`
 
 The V1 utility modules also include:
 
 - `io.read_text(path)` / `io.write_text(path, text)`
 - `io.read_bytes(path)` / `io.write_bytes(path, bytes)`
+- `io.append_text(path, text)` / `io.append_bytes(path, bytes)`
+- `io.read_lines(path)` / `io.write_lines(path, lines)`
 - `path.join(...)`, `path.normpath(...)`, `path.abspath(...)`
 - `path.basename(...)`, `path.dirname(...)`, `path.splitext(...)`
+- `path.exists(...)`, `path.isdir(...)`, `path.isfile(...)`
+- `path.split(...)`, `path.relpath(path, start=".")`
 - `logging.debug/info/warn/error(...)`
+- `logging.basicConfig(level=...)`, `logging.exception(exc)`
 - `logging.getLogger(name)`
 - `traceback.format_exception(exc)` / `traceback.print_exception(exc)`
-- minimal `sys` metadata: `implementation`, `version`, `version_info`, `platform`, `argv`
+- `traceback.format_exception_only(exc)` / `traceback.as_dict(exc)`
+- minimal `sys` metadata: `implementation`, `version`, `version_info`, `platform`, `argv`, `path`, `byteorder`, `executable`
 - `collections.Counter`, `collections.defaultdict`, `collections.flatten`, `collections.chunked`
 - `itertools.chain`, `itertools.repeat`, `itertools.take`, `itertools.batched`
 - `functools.partial`, `functools.compose`

@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include "tensorpy/platform.h"
 
@@ -149,6 +150,25 @@ char* platformGetEnvironmentVariable(const char* name) {
     }
 
     return duplicateString(value);
+}
+
+int platformSystemCommand(const char* command) {
+    int status;
+
+    if (command == NULL) {
+        return -1;
+    }
+
+    status = system(command);
+    if (status < 0) {
+        return -1;
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    return status;
 }
 
 double platformClockSeconds(void) {

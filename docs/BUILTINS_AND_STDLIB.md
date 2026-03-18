@@ -92,6 +92,10 @@ Examples already supported include methods such as:
   - `remove(path)`
   - `rmdir(path)`
   - `rename(src, dst)`
+  - `replace(src, dst)`
+  - `removedirs(path)`
+  - `getenv(name, default=None)`
+  - `system(command)`
 - `io`
   - `read_text(path)`
   - `write_text(path, text)`

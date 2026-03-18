@@ -63,6 +63,18 @@ def abspath(value):
     return normpath(join(os.getcwd(), value))
 
 
+def exists(value):
+    return os.exists(value)
+
+
+def isdir(value):
+    return os.isdir(value)
+
+
+def isfile(value):
+    return os.isfile(value)
+
+
 def basename(value):
     normalized = normpath(value)
     if normalized == os.sep:
@@ -106,3 +118,34 @@ def splitext(value):
     if dirpart == os.sep:
         return (os.sep + root, ext)
     return (join(dirpart, root), ext)
+
+
+def split(value):
+    return (dirname(value), basename(value))
+
+
+def relpath(value, start="."):
+    target = abspath(value)
+    origin = abspath(start)
+
+    target_parts = target.split(os.sep)
+    origin_parts = origin.split(os.sep)
+
+    if len(target_parts) > 0 and target_parts[0] == "":
+        target_parts.pop(0)
+    if len(origin_parts) > 0 and origin_parts[0] == "":
+        origin_parts.pop(0)
+
+    while len(target_parts) > 0 and len(origin_parts) > 0 and target_parts[0] == origin_parts[0]:
+        target_parts.pop(0)
+        origin_parts.pop(0)
+
+    result = []
+    for _ in origin_parts:
+        result.append("..")
+    for piece in target_parts:
+        result.append(piece)
+
+    if len(result) == 0:
+        return "."
+    return join(*result)

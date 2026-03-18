@@ -482,6 +482,11 @@ static Value platformGetenvNative(int argCount, Value* args) {
     return OBJ_VAL(result);
 }
 
+static Value platformSystemNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return NUMBER_VAL(-1);
+    return NUMBER_VAL((double)platformSystemCommand(AS_CSTRING(args[0])));
+}
+
 static Value platformListdirNative(int argCount, Value* args) {
     const char* path = ".";
     char** entries;
@@ -708,6 +713,7 @@ void registerBuiltins() {
     defineNative("__platform_write_text", platformWriteTextNative);
     defineNative("__platform_write_bytes", platformWriteBytesNative);
     defineNative("__platform_getenv", platformGetenvNative);
+    defineNative("__platform_system", platformSystemNative);
     defineNative("__platform_listdir", platformListdirNative);
     defineNative("__platform_exists", platformExistsNative);
     defineNative("__platform_isdir", platformIsdirNative);

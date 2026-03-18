@@ -22,6 +22,13 @@ def isfile(path):
     return __platform_isfile(path)
 
 
+def getenv(name, default=None):
+    value = __platform_getenv(name)
+    if value is None:
+        return default
+    return value
+
+
 def _raise_os_error(action, path):
     raise OSError(action + " failed: " + path)
 
@@ -58,3 +65,29 @@ def rename(src, dst):
     if __platform_rename(src, dst):
         return None
     raise OSError("rename failed: " + src + " -> " + dst)
+
+
+def replace(src, dst):
+    return rename(src, dst)
+
+
+def system(command):
+    return __platform_system(command)
+
+
+def _parent_dir(path):
+    pieces = path.split(sep)
+    if len(pieces) <= 1:
+        return ""
+    pieces.pop()
+    return sep.join(pieces)
+
+
+def removedirs(path):
+    current = path
+    while current != "" and current != "." and current != sep:
+        if not isdir(current):
+            break
+        rmdir(current)
+        current = _parent_dir(current)
+    return None
