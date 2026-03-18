@@ -31,6 +31,11 @@ This project is still in an active build-out phase. The goal right now is practi
   - `time`
   - `random`
   - `os`
+  - `io`
+  - `path`
+  - `logging`
+  - `traceback`
+  - `sys`
 - Platform-facing runtime operations are routed through a portability layer in `src/platform.c`
 
 ## Milestone Status
@@ -108,6 +113,22 @@ The `os` module currently supports:
 - `os.exists(path)`
 - `os.isdir(path)`
 - `os.isfile(path)`
+- `os.mkdir(path, exist_ok=False)`
+- `os.makedirs(path, exist_ok=False)`
+- `os.remove(path)`
+- `os.rmdir(path)`
+- `os.rename(src, dst)`
+
+The V1 utility modules also include:
+
+- `io.read_text(path)` / `io.write_text(path, text)`
+- `io.read_bytes(path)` / `io.write_bytes(path, bytes)`
+- `path.join(...)`, `path.normpath(...)`, `path.abspath(...)`
+- `path.basename(...)`, `path.dirname(...)`, `path.splitext(...)`
+- `logging.debug/info/warn/error(...)`
+- `logging.getLogger(name)`
+- `traceback.format_exception(exc)` / `traceback.print_exception(exc)`
+- minimal `sys` metadata: `implementation`, `version`, `version_info`, `platform`, `argv`
 
 The `re` module currently supports a useful regex subset:
 

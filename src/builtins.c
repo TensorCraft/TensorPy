@@ -407,6 +407,49 @@ static Value platformNameNative(int argCount, Value* args) {
     return OBJ_VAL(copyString(name, (int)strlen(name)));
 }
 
+static Value platformReadTextNative(int argCount, Value* args) {
+    char* text;
+    ObjString* result;
+
+    if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
+
+    text = platformReadTextFile(AS_CSTRING(args[0]));
+    if (text == NULL) return NIL_VAL;
+
+    result = copyString(text, (int)strlen(text));
+    free(text);
+    return OBJ_VAL(result);
+}
+
+static Value platformReadBytesNative(int argCount, Value* args) {
+    int count = 0;
+    uint8_t* bytes;
+    ObjBytes* result;
+
+    if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
+
+    bytes = platformReadBinaryFile(AS_CSTRING(args[0]), &count);
+    if (bytes == NULL && count != 0) return NIL_VAL;
+
+    result = newBytes(count, bytes);
+    free(bytes);
+    return OBJ_VAL(result);
+}
+
+static Value platformWriteTextNative(int argCount, Value* args) {
+    if (argCount != 2 || !IS_STRING(args[0]) || !IS_STRING(args[1])) return BOOL_VAL(false);
+    return BOOL_VAL(platformWriteTextFile(AS_CSTRING(args[0]), AS_CSTRING(args[1])));
+}
+
+static Value platformWriteBytesNative(int argCount, Value* args) {
+    ObjBytes* bytes;
+
+    if (argCount != 2 || !IS_STRING(args[0]) || !IS_BYTES(args[1])) return BOOL_VAL(false);
+
+    bytes = AS_BYTES(args[1]);
+    return BOOL_VAL(platformWriteBinaryFile(AS_CSTRING(args[0]), bytes->bytes, bytes->length));
+}
+
 static Value platformListdirNative(int argCount, Value* args) {
     const char* path = ".";
     char** entries;
@@ -445,6 +488,31 @@ static Value platformIsdirNative(int argCount, Value* args) {
 static Value platformIsfileNative(int argCount, Value* args) {
     if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
     return BOOL_VAL(platformPathIsFile(AS_CSTRING(args[0])));
+}
+
+static Value platformMkdirNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return BOOL_VAL(false);
+    return BOOL_VAL(platformCreateDirectory(AS_CSTRING(args[0])));
+}
+
+static Value platformMakedirsNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return BOOL_VAL(false);
+    return BOOL_VAL(platformCreateDirectories(AS_CSTRING(args[0])));
+}
+
+static Value platformRemoveNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return BOOL_VAL(false);
+    return BOOL_VAL(platformRemoveFile(AS_CSTRING(args[0])));
+}
+
+static Value platformRmdirNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) return BOOL_VAL(false);
+    return BOOL_VAL(platformRemoveDirectory(AS_CSTRING(args[0])));
+}
+
+static Value platformRenameNative(int argCount, Value* args) {
+    if (argCount != 2 || !IS_STRING(args[0]) || !IS_STRING(args[1])) return BOOL_VAL(false);
+    return BOOL_VAL(platformRenamePath(AS_CSTRING(args[0]), AS_CSTRING(args[1])));
 }
 
 static Value gcMarkCountNative(int argCount, Value* args) {
@@ -602,10 +670,19 @@ void registerBuiltins() {
     defineNative("__platform_random", platformRandomNative);
     defineNative("__platform_getcwd", platformGetcwdNative);
     defineNative("__platform_name", platformNameNative);
+    defineNative("__platform_read_text", platformReadTextNative);
+    defineNative("__platform_read_bytes", platformReadBytesNative);
+    defineNative("__platform_write_text", platformWriteTextNative);
+    defineNative("__platform_write_bytes", platformWriteBytesNative);
     defineNative("__platform_listdir", platformListdirNative);
     defineNative("__platform_exists", platformExistsNative);
     defineNative("__platform_isdir", platformIsdirNative);
     defineNative("__platform_isfile", platformIsfileNative);
+    defineNative("__platform_mkdir", platformMkdirNative);
+    defineNative("__platform_makedirs", platformMakedirsNative);
+    defineNative("__platform_remove", platformRemoveNative);
+    defineNative("__platform_rmdir", platformRmdirNative);
+    defineNative("__platform_rename", platformRenameNative);
     defineNative("__gc_mark_count", gcMarkCountNative);
     defineNative("__gc_reachable_count", gcReachableCountNative);
     defineNative("__gc_collect", gcCollectNative);

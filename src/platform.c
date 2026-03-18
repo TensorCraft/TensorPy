@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -33,6 +34,88 @@ char* platformReadTextFile(const char* path) {
 
     buffer[bytesRead] = '\0';
     return buffer;
+}
+
+uint8_t* platformReadBinaryFile(const char* path, int* count) {
+    FILE* file;
+    long fileSize;
+    uint8_t* buffer;
+    size_t bytesRead;
+
+    if (count == NULL) {
+        return NULL;
+    }
+
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+
+    if (fseek(file, 0L, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+
+    fileSize = ftell(file);
+    if (fileSize < 0) {
+        fclose(file);
+        return NULL;
+    }
+    rewind(file);
+
+    buffer = (uint8_t*)malloc((size_t)fileSize);
+    if (buffer == NULL && fileSize > 0) {
+        fclose(file);
+        return NULL;
+    }
+
+    bytesRead = fread(buffer, sizeof(uint8_t), (size_t)fileSize, file);
+    fclose(file);
+    if (bytesRead < (size_t)fileSize) {
+        free(buffer);
+        return NULL;
+    }
+
+    *count = (int)fileSize;
+    return buffer;
+}
+
+bool platformWriteTextFile(const char* path, const char* text) {
+    FILE* file;
+    size_t length;
+    size_t bytesWritten;
+
+    if (path == NULL || text == NULL) {
+        return false;
+    }
+
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        return false;
+    }
+
+    length = strlen(text);
+    bytesWritten = fwrite(text, sizeof(char), length, file);
+    fclose(file);
+    return bytesWritten == length;
+}
+
+bool platformWriteBinaryFile(const char* path, const uint8_t* bytes, int count) {
+    FILE* file;
+    size_t bytesWritten;
+
+    if (path == NULL || count < 0 || (count > 0 && bytes == NULL)) {
+        return false;
+    }
+
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        return false;
+    }
+
+    bytesWritten = fwrite(bytes, sizeof(uint8_t), (size_t)count, file);
+    fclose(file);
+    return bytesWritten == (size_t)count;
 }
 
 double platformClockSeconds(void) {
@@ -156,6 +239,80 @@ bool platformPathIsDirectory(const char* path) {
 bool platformPathIsFile(const char* path) {
     struct stat info;
     return platformStatPath(path, &info) && S_ISREG(info.st_mode);
+}
+
+bool platformCreateDirectory(const char* path) {
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+
+    return mkdir(path, 0777) == 0;
+}
+
+bool platformCreateDirectories(const char* path) {
+    char* copy;
+    size_t length;
+    size_t i;
+
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+
+    if (platformPathIsDirectory(path)) {
+        return true;
+    }
+
+    length = strlen(path);
+    copy = (char*)malloc(length + 1);
+    if (copy == NULL) {
+        return false;
+    }
+    memcpy(copy, path, length + 1);
+
+    for (i = 1; i < length; i++) {
+        if (copy[i] != '/') {
+            continue;
+        }
+
+        copy[i] = '\0';
+        if (copy[0] != '\0' && !platformPathIsDirectory(copy) && mkdir(copy, 0777) != 0) {
+            free(copy);
+            return false;
+        }
+        copy[i] = '/';
+    }
+
+    if (!platformPathIsDirectory(copy) && mkdir(copy, 0777) != 0) {
+        free(copy);
+        return false;
+    }
+
+    free(copy);
+    return true;
+}
+
+bool platformRemoveFile(const char* path) {
+    if (path == NULL) {
+        return false;
+    }
+
+    return unlink(path) == 0;
+}
+
+bool platformRemoveDirectory(const char* path) {
+    if (path == NULL) {
+        return false;
+    }
+
+    return rmdir(path) == 0;
+}
+
+bool platformRenamePath(const char* from, const char* to) {
+    if (from == NULL || to == NULL) {
+        return false;
+    }
+
+    return rename(from, to) == 0;
 }
 
 const char* platformName(void) {

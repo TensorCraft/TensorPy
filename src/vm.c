@@ -617,6 +617,7 @@ void initVM() {
     registerBuiltins();
     defineGlobalClass("Exception", NULL);
     defineGlobalClass("RuntimeError", "Exception");
+    defineGlobalClass("OSError", "Exception");
     defineGlobalClass("TypeError", "Exception");
     defineGlobalClass("ValueError", "Exception");
     defineGlobalClass("KeyError", "Exception");
