@@ -36,6 +36,15 @@ This project is still in an active build-out phase. The goal right now is practi
   - `logging`
   - `traceback`
   - `sys`
+  - `collections`
+  - `itertools`
+  - `functools`
+  - `env`
+  - `config`
+  - `host`
+  - `array`
+  - `types`
+  - `inspect`
 - Platform-facing runtime operations are routed through a portability layer in `src/platform.c`
 
 ## Milestone Status
@@ -129,6 +138,15 @@ The V1 utility modules also include:
 - `logging.getLogger(name)`
 - `traceback.format_exception(exc)` / `traceback.print_exception(exc)`
 - minimal `sys` metadata: `implementation`, `version`, `version_info`, `platform`, `argv`
+- `collections.Counter`, `collections.defaultdict`, `collections.flatten`, `collections.chunked`
+- `itertools.chain`, `itertools.repeat`, `itertools.take`, `itertools.batched`
+- `functools.partial`, `functools.compose`
+- `env.get`, `env.exists`, `env.require`
+- `config.load`, `config.loads`, `config.get`, `config.require`, `config.merge`
+- `host.set`, `host.get`, `host.has`, `host.call`
+- `array.zeros`, `array.full`, `array.shape`, `array.add`, `array.mul`, `array.matmul`
+- `types.type_name` plus basic `is_*` helpers
+- `inspect.type_name`, `inspect.is_callable`, `inspect.is_function`, `inspect.is_class`, `inspect.is_module`
 
 The `re` module currently supports a useful regex subset:
 
@@ -294,6 +312,8 @@ The current readiness call is:
 More detail is documented in:
 
 - [docs/C_API_READINESS.md](/Users/tensorcraft/Projects/TensorPy/docs/C_API_READINESS.md)
+- [docs/SYNTAX.md](/Users/tensorcraft/Projects/TensorPy/docs/SYNTAX.md)
+- [docs/BUILTINS_AND_STDLIB.md](/Users/tensorcraft/Projects/TensorPy/docs/BUILTINS_AND_STDLIB.md)
 - missing GC work for later phases
 - incomplete Python compatibility for many edge cases and advanced syntax forms
 

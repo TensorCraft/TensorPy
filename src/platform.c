@@ -9,6 +9,24 @@
 
 #include "tensorpy/platform.h"
 
+static char* duplicateString(const char* source) {
+    size_t length;
+    char* copy;
+
+    if (source == NULL) {
+        return NULL;
+    }
+
+    length = strlen(source);
+    copy = (char*)malloc(length + 1);
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    memcpy(copy, source, length + 1);
+    return copy;
+}
+
 char* platformReadTextFile(const char* path) {
     FILE* file = fopen(path, "rb");
     if (file == NULL) {
@@ -116,6 +134,21 @@ bool platformWriteBinaryFile(const char* path, const uint8_t* bytes, int count) 
     bytesWritten = fwrite(bytes, sizeof(uint8_t), (size_t)count, file);
     fclose(file);
     return bytesWritten == (size_t)count;
+}
+
+char* platformGetEnvironmentVariable(const char* name) {
+    const char* value;
+
+    if (name == NULL) {
+        return NULL;
+    }
+
+    value = getenv(name);
+    if (value == NULL) {
+        return NULL;
+    }
+
+    return duplicateString(value);
 }
 
 double platformClockSeconds(void) {

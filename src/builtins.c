@@ -309,6 +309,24 @@ static Value hasattrNative(int argCount, Value* args) {
     return BOOL_VAL(getAttributeValue(args[0], AS_STRING(args[1]), &value));
 }
 
+static Value callableNative(int argCount, Value* args) {
+    Value value;
+    ObjString* callName;
+
+    if (argCount != 1) return BOOL_VAL(false);
+
+    if (IS_NATIVE(args[0]) || IS_CLOSURE(args[0]) || IS_CLASS(args[0]) || IS_BOUND_METHOD(args[0])) {
+        return BOOL_VAL(true);
+    }
+
+    if (!IS_INSTANCE(args[0])) {
+        return BOOL_VAL(false);
+    }
+
+    callName = copyString("__call__", 8);
+    return BOOL_VAL(getAttributeValue(args[0], callName, &value));
+}
+
 // Built-in: setattr()
 static Value setattrNative(int argCount, Value* args) {
     if (argCount != 3 || !IS_STRING(args[1])) return NIL_VAL;
@@ -448,6 +466,20 @@ static Value platformWriteBytesNative(int argCount, Value* args) {
 
     bytes = AS_BYTES(args[1]);
     return BOOL_VAL(platformWriteBinaryFile(AS_CSTRING(args[0]), bytes->bytes, bytes->length));
+}
+
+static Value platformGetenvNative(int argCount, Value* args) {
+    char* value;
+    ObjString* result;
+
+    if (argCount != 1 || !IS_STRING(args[0])) return NIL_VAL;
+
+    value = platformGetEnvironmentVariable(AS_CSTRING(args[0]));
+    if (value == NULL) return NIL_VAL;
+
+    result = copyString(value, (int)strlen(value));
+    free(value);
+    return OBJ_VAL(result);
 }
 
 static Value platformListdirNative(int argCount, Value* args) {
@@ -662,6 +694,7 @@ void registerBuiltins() {
     defineNative("getattr", getattrNative);
     defineNative("hasattr", hasattrNative);
     defineNative("setattr", setattrNative);
+    defineNative("callable", callableNative);
     defineNative("round", roundNative);
     defineNative("ord", ordNative);
     defineNative("chr", chrNative);
@@ -674,6 +707,7 @@ void registerBuiltins() {
     defineNative("__platform_read_bytes", platformReadBytesNative);
     defineNative("__platform_write_text", platformWriteTextNative);
     defineNative("__platform_write_bytes", platformWriteBytesNative);
+    defineNative("__platform_getenv", platformGetenvNative);
     defineNative("__platform_listdir", platformListdirNative);
     defineNative("__platform_exists", platformExistsNative);
     defineNative("__platform_isdir", platformIsdirNative);
