@@ -6,6 +6,19 @@ def run_test(test_file):
     print(f"Running {test_file}...", end=" ", flush=True)
     try:
         basename = os.path.basename(test_file)
+        if basename.startswith("test_host_"):
+            result = subprocess.run(
+                ["python3", test_file],
+                capture_output=True,
+                text=True,
+                timeout=20
+            )
+            if result.returncode == 0:
+                print("\033[92mPASSED\033[0m")
+                return True, result.stdout
+            print("\033[91mFAILED\033[0m")
+            return False, result.stderr + result.stdout
+
         if basename.startswith("test_repl_"):
             with open(test_file, "r", encoding="utf-8") as f:
                 result = subprocess.run(

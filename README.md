@@ -124,6 +124,23 @@ Supported regex constructs currently include:
 - `\d`, `\w`, `\s`
 - captured-group access via `group(1)`, `start(1)`, `end(1)`, and `span(1)`
 
+## C API Status
+
+TensorPy now includes a minimal public embedding header:
+
+- `include/tensorpy/api.h`
+
+It exposes an opaque `TPContext` plus small helpers for:
+
+- creating a context
+- interpreting source in that context
+- destroying the context
+
+This is enough to begin embedding TensorPy from C without including `vm.h` or
+other internal runtime headers. The detailed readiness notes live in:
+
+- `docs/C_API_READINESS.md`
+
 ## Build
 
 ```bash

@@ -9,15 +9,26 @@ The new public header is:
 
 - `include/tensorpy/api.h`
 
-It currently exposes only:
+It currently exposes:
 
+- `TPContext`
+- `tpContextCreate()`
+- `tpContextDestroy()`
+- `tpContextInterpret(context, source, filename)`
 - `tpInit()`
 - `tpFree()`
 - `tpInterpret(source, filename)`
 - `TPResult`
 
-This is intentionally small. It gives embedders a stable "start / run code /
-shutdown" entry point without exposing VM internals.
+This is intentionally small. It gives embedders a stable "create context / run
+code / destroy context" entry point without exposing VM internals.
+
+The new context handle is still a Phase 0 embedding surface:
+
+- `TPContext` is opaque to callers
+- only one active context is supported at a time
+- the old `tpInit/tpFree/tpInterpret` helpers remain as compatibility wrappers
+  over an internal default context
 
 ## Still Internal
 
@@ -52,6 +63,8 @@ Why:
 - code execution has a stable top-level entry point
 - runtime teardown and GC exist
 - the interpreter no longer requires callers to know about `VM` directly
+- callers can now hold an opaque runtime handle instead of binding to global VM
+  details
 
 ### Extension Module ABI
 
@@ -70,8 +83,9 @@ What is still missing:
 If we want to move toward external C integration, the next milestone should be:
 
 1. keep `api.h` minimal and stable
-2. design a public opaque runtime/context handle instead of exposing globals
-3. define a tiny public value API for strings, numbers, booleans, and errors
+2. define a tiny public value API for strings, numbers, booleans, and errors
+3. decide whether Phase 1 embedding should support multiple simultaneous
+   contexts or keep a single-active-context rule
 4. only then sketch an extension-module registration ABI
 
 That means:

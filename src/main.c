@@ -85,7 +85,7 @@ static bool lineStartsBlock(const char* line) {
     return len > 0 && line[len - 1] == ':';
 }
 
-static void repl() {
+static void repl(TPContext* context) {
     char line[1024];
     char wrapped[1152];
     char block[8192];
@@ -97,7 +97,7 @@ static void repl() {
 
         if (!fgets(line, sizeof(line), stdin)) {
             if (collecting && block[0] != '\0') {
-                tpInterpret(block, "stdin");
+                tpContextInterpret(context, block, "stdin");
             }
             printf("\n");
             break;
@@ -105,7 +105,7 @@ static void repl() {
 
         if (collecting) {
             if (isBlankLine(line)) {
-                tpInterpret(block, "stdin");
+                tpContextInterpret(context, block, "stdin");
                 block[0] = '\0';
                 collecting = false;
                 continue;
@@ -122,9 +122,9 @@ static void repl() {
 
         if (isLikelyExpression(line)) {
             snprintf(wrapped, sizeof(wrapped), "print(%s)", line);
-            tpInterpret(wrapped, "stdin");
+            tpContextInterpret(context, wrapped, "stdin");
         } else {
-            tpInterpret(line, "stdin");
+            tpContextInterpret(context, line, "stdin");
         }
     }
 }
@@ -138,9 +138,9 @@ static char* readFile(const char* path) {
     return buffer;
 }
 
-static void runFile(const char* path) {
+static void runFile(TPContext* context, const char* path) {
     char* source = readFile(path);
-    TPResult result = tpInterpret(source, path);
+    TPResult result = tpContextInterpret(context, source, path);
     free(source);
 
     if (result == TP_COMPILE_ERROR) exit(65);
@@ -148,20 +148,25 @@ static void runFile(const char* path) {
 }
 
 int main(int argc, const char* argv[]) {
-    tpInit();
+    TPContext* context = tpContextCreate();
+    if (context == NULL) {
+        fprintf(stderr, "Failed to initialize TensorPy context.\n");
+        return 70;
+    }
 
     if (argc == 1) {
-        repl();
+        repl(context);
     } else if (argc == 2) {
-        runFile(argv[1]);
+        runFile(context, argv[1]);
     } else if (argc == 3 && strcmp(argv[1], "-c") == 0) {
-        tpInterpret(argv[2], "command line");
+        tpContextInterpret(context, argv[2], "command line");
     } else {
         fprintf(stderr, "Usage: tensorpy [path]\n");
         fprintf(stderr, "       tensorpy -c \"code\"\n");
+        tpContextDestroy(context);
         exit(64);
     }
 
-    tpFree();
+    tpContextDestroy(context);
     return 0;
 }

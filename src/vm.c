@@ -7,7 +7,6 @@
 #include <ctype.h>
 
 #include "tensorpy/common.h"
-#include "tensorpy/api.h"
 #include "tensorpy/builtins.h"
 #include "tensorpy/compiler.h"
 #include "tensorpy/debug.h"
@@ -3507,23 +3506,4 @@ static InterpretResult interpretInGlobals(const char* source, const char* filena
 
 InterpretResult interpret(const char* source, const char* filename) {
     return interpretInGlobals(source, filename, vm.globalEnv);
-}
-
-void tpInit(void) {
-    initVM();
-}
-
-void tpFree(void) {
-    freeVM();
-}
-
-TPResult tpInterpret(const char* source, const char* filename) {
-    InterpretResult result = interpret(source, filename);
-    if (result == INTERPRET_COMPILE_ERROR) {
-        return TP_COMPILE_ERROR;
-    }
-    if (result == INTERPRET_RUNTIME_ERROR) {
-        return TP_RUNTIME_ERROR;
-    }
-    return TP_OK;
 }
