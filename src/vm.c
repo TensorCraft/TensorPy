@@ -896,10 +896,19 @@ static bool callValue(Value callee, int argCount) {
                 ObjNative* previousNative = vm.currentNative;
                 bool previousNativeExceptionRaised = vm.nativeExceptionRaised;
                 NativeFn native = nativeObj->function;
+                Value copiedArgs[256];
+                Value* nativeArgs = vm.stackTop - argCount;
+                if (argCount > 256) {
+                    runtimeError("Too many arguments for native call.");
+                    return false;
+                }
+                for (int i = 0; i < argCount; i++) {
+                    copiedArgs[i] = nativeArgs[i];
+                }
                 vm.gcPauseDepth++;
                 vm.currentNative = nativeObj;
                 vm.nativeExceptionRaised = false;
-                Value result = native(argCount, vm.stackTop - argCount);
+                Value result = native(argCount, copiedArgs);
                 bool nativeFailed = vm.nativeExceptionRaised;
                 vm.currentNative = previousNative;
                 vm.nativeExceptionRaised = previousNativeExceptionRaised;
@@ -3255,14 +3264,29 @@ static InterpretResult run() {
                 if (IS_INT(peek(0)) && IS_INT(peek(1))) {
                     ObjInt* divisor = AS_INT(pop());
                     ObjInt* dividend = AS_INT(pop());
+                    ObjInt* quotient;
+                    ObjInt* remainder;
+                    int64_t a64;
+                    int64_t b64;
                     if (intIsZero(divisor)) {
                         if (raiseException(createExceptionValue("ZeroDivisionError", "Division by zero."))) {
                             HANDLE_RE();
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    double result = fmod(intToDouble(dividend), intToDouble(divisor));
-                    push(NUMBER_VAL(result));
+                    if (intToInt64Exact(dividend, &a64) && intToInt64Exact(divisor, &b64)) {
+                        int64_t r = a64 % b64;
+                        if (r != 0 && ((r > 0) != (b64 > 0))) {
+                            r += b64;
+                        }
+                        push(OBJ_VAL(newIntFromInt64(r)));
+                        break;
+                    }
+                    if (!intDivMod(dividend, divisor, &quotient, &remainder)) {
+                        runtimeError("Out of memory.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(OBJ_VAL(remainder));
                     break;
                 }
                 if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) {
@@ -3285,13 +3309,30 @@ static InterpretResult run() {
                 if (IS_INT(peek(0)) && IS_INT(peek(1))) {
                     ObjInt* divisor = AS_INT(pop());
                     ObjInt* dividend = AS_INT(pop());
+                    ObjInt* quotient;
+                    ObjInt* remainder;
+                    int64_t a64;
+                    int64_t b64;
                     if (intIsZero(divisor)) {
                         if (raiseException(createExceptionValue("ZeroDivisionError", "Division by zero."))) {
                             HANDLE_RE();
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    push(NUMBER_VAL(floor(intToDouble(dividend) / intToDouble(divisor))));
+                    if (intToInt64Exact(dividend, &a64) && intToInt64Exact(divisor, &b64)) {
+                        int64_t q = a64 / b64;
+                        int64_t r = a64 % b64;
+                        if (r != 0 && ((r > 0) != (b64 > 0))) {
+                            q -= 1;
+                        }
+                        push(OBJ_VAL(newIntFromInt64(q)));
+                        break;
+                    }
+                    if (!intDivMod(dividend, divisor, &quotient, &remainder)) {
+                        runtimeError("Out of memory.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(OBJ_VAL(quotient));
                     break;
                 }
                 if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) {

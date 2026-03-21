@@ -178,6 +178,45 @@ static ObjInt* mulAbsInt(const ObjInt* a, const ObjInt* b) {
     return out;
 }
 
+static ObjInt* shiftAbsIntAndAddDigit(const ObjInt* value, uint32_t digit) {
+    ObjInt* out;
+    if (value->length == 1 && value->digits[0] == 0) {
+        return intFromUint64((uint64_t)digit, false);
+    }
+    out = allocateInt(value->length + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    out->digits[0] = digit;
+    memcpy(out->digits + 1, value->digits, sizeof(uint32_t) * (size_t)value->length);
+    trimInt(out);
+    return out;
+}
+
+static ObjInt* mulAbsIntSmall(const ObjInt* value, uint32_t factor) {
+    ObjInt* out;
+    uint64_t carry = 0;
+
+    if (factor == 0) {
+        return intFromUint64(0, false);
+    }
+    if (factor == 1) {
+        return copyInt(value);
+    }
+    out = allocateInt(value->length + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < value->length; i++) {
+        uint64_t cur = (uint64_t)value->digits[i] * factor + carry;
+        out->digits[i] = (uint32_t)(cur % TP_INT_BASE);
+        carry = cur / TP_INT_BASE;
+    }
+    out->digits[value->length] = (uint32_t)carry;
+    trimInt(out);
+    return out;
+}
+
 int intCompare(const ObjInt* a, const ObjInt* b) {
     if (a->negative != b->negative) {
         return a->negative ? -1 : 1;
@@ -220,6 +259,109 @@ ObjInt* intMul(const ObjInt* a, const ObjInt* b) {
     return out;
 }
 
+bool intDivMod(const ObjInt* a, const ObjInt* b, ObjInt** outQuotient, ObjInt** outRemainder) {
+    ObjInt absA = *a;
+    ObjInt absB = *b;
+    ObjInt* quotient;
+    ObjInt* remainder;
+    int cmp;
+
+    if (outQuotient == NULL || outRemainder == NULL || intIsZero(b)) {
+        return false;
+    }
+
+    vm.gcPauseDepth++;
+
+    absA.negative = false;
+    absB.negative = false;
+    cmp = compareAbsInt(&absA, &absB);
+    if (cmp < 0) {
+        quotient = intFromUint64(0, false);
+        remainder = copyInt(&absA);
+        if (quotient == NULL || remainder == NULL) {
+            vm.gcPauseDepth--;
+            return false;
+        }
+    } else if (cmp == 0) {
+        quotient = intFromUint64(1, false);
+        remainder = intFromUint64(0, false);
+        if (quotient == NULL || remainder == NULL) {
+            vm.gcPauseDepth--;
+            return false;
+        }
+    } else {
+        quotient = allocateInt(absA.length);
+        remainder = intFromUint64(0, false);
+        if (quotient == NULL || remainder == NULL) {
+            vm.gcPauseDepth--;
+            return false;
+        }
+
+        for (int i = absA.length - 1; i >= 0; i--) {
+            ObjInt* nextRemainder = shiftAbsIntAndAddDigit(remainder, absA.digits[i]);
+            uint32_t low = 0;
+            uint32_t high = TP_INT_BASE - 1;
+            uint32_t qdigit = 0;
+            remainder = nextRemainder;
+            if (remainder == NULL) {
+                vm.gcPauseDepth--;
+                return false;
+            }
+            while (low <= high) {
+                uint32_t mid = low + (high - low) / 2;
+                ObjInt* product = mulAbsIntSmall(&absB, mid);
+                int rel;
+                if (product == NULL) {
+                    vm.gcPauseDepth--;
+                    return false;
+                }
+                rel = compareAbsInt(product, remainder);
+                if (rel <= 0) {
+                    qdigit = mid;
+                    low = mid + 1;
+                } else {
+                    if (mid == 0) break;
+                    high = mid - 1;
+                }
+            }
+            quotient->digits[i] = qdigit;
+            if (qdigit != 0) {
+                ObjInt* product = mulAbsIntSmall(&absB, qdigit);
+                ObjInt* next = subAbsInt(remainder, product);
+                if (product == NULL || next == NULL) {
+                    vm.gcPauseDepth--;
+                    return false;
+                }
+                remainder = next;
+            }
+        }
+        trimInt(quotient);
+        trimInt(remainder);
+    }
+
+    if ((a->negative != b->negative) && !intIsZero(remainder)) {
+        ObjInt* one = intFromUint64(1, false);
+        ObjInt* qAdj = addAbsInt(quotient, one);
+        ObjInt* rAdj = subAbsInt(&absB, remainder);
+        if (one == NULL || qAdj == NULL || rAdj == NULL) {
+            vm.gcPauseDepth--;
+            return false;
+        }
+        quotient = qAdj;
+        remainder = rAdj;
+        quotient->negative = true;
+        remainder->negative = b->negative;
+    } else {
+        quotient->negative = (a->negative != b->negative) && !intIsZero(quotient);
+        remainder->negative = b->negative && !intIsZero(remainder);
+    }
+
+    vm.gcPauseDepth--;
+    *outQuotient = quotient;
+    *outRemainder = remainder;
+    return true;
+}
+
 uint32_t intHash(const ObjInt* value) {
     uint32_t hash = value->negative ? 0x9e3779b9u : 0x7f4a7c15u;
     for (int i = 0; i < value->length; i++) {
@@ -245,6 +387,35 @@ static bool isZeroInt(const ObjInt* value) {
 
 bool intIsZero(const ObjInt* value) {
     return isZeroInt(value);
+}
+
+bool intToInt64Exact(const ObjInt* value, int64_t* out) {
+    uint64_t result = 0;
+    uint64_t limit = value->negative ? ((uint64_t)INT64_MAX + 1u) : (uint64_t)INT64_MAX;
+
+    if (out == NULL) {
+        return false;
+    }
+    for (int i = value->length - 1; i >= 0; i--) {
+        if (result > limit / TP_INT_BASE) {
+            return false;
+        }
+        result *= TP_INT_BASE;
+        if (result > limit - value->digits[i]) {
+            return false;
+        }
+        result += value->digits[i];
+    }
+    if (value->negative) {
+        if (result == (uint64_t)INT64_MAX + 1u) {
+            *out = INT64_MIN;
+        } else {
+            *out = -(int64_t)result;
+        }
+    } else {
+        *out = (int64_t)result;
+    }
+    return true;
 }
 
 static ObjInt* parseIntString(const char* chars, int length) {

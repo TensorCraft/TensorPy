@@ -1890,7 +1890,9 @@ static Value minNative(int argCount, Value* args) {
     if (argCount == 0) return NIL_VAL;
     Value minVal = args[0];
     for (int i = 1; i < argCount; i++) {
-        if (IS_NUMBER(args[i]) && IS_NUMBER(minVal)) {
+        if (IS_INT(args[i]) && IS_INT(minVal)) {
+            if (intCompare(AS_INT(args[i]), AS_INT(minVal)) < 0) minVal = args[i];
+        } else if (IS_NUMBER(args[i]) && IS_NUMBER(minVal)) {
             if (AS_NUMBER(args[i]) < AS_NUMBER(minVal)) minVal = args[i];
         }
     }
@@ -1902,7 +1904,9 @@ static Value maxNative(int argCount, Value* args) {
     if (argCount == 0) return NIL_VAL;
     Value maxVal = args[0];
     for (int i = 1; i < argCount; i++) {
-        if (IS_NUMBER(args[i]) && IS_NUMBER(maxVal)) {
+        if (IS_INT(args[i]) && IS_INT(maxVal)) {
+            if (intCompare(AS_INT(args[i]), AS_INT(maxVal)) > 0) maxVal = args[i];
+        } else if (IS_NUMBER(args[i]) && IS_NUMBER(maxVal)) {
             if (AS_NUMBER(args[i]) > AS_NUMBER(maxVal)) maxVal = args[i];
         }
     }
