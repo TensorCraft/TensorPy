@@ -3,7 +3,22 @@
 #include <stdlib.h>
 
 #include "tensorpy/value.h"
+#include "tensorpy/memory.h"
 #include "tensorpy/object.h"
+
+bool isNumericValue(Value value) {
+    return value.type == VAL_NUMBER || IS_INT(value);
+}
+
+double numericValue(Value value) {
+    if (value.type == VAL_NUMBER) {
+        return value.as.number;
+    }
+    if (IS_INT(value)) {
+        return intToDouble(AS_INT(value));
+    }
+    return 0.0;
+}
 
 static void printEscapedString(ObjString* string) {
     printf("\"");
@@ -67,7 +82,19 @@ void printValue(Value value) {
             printf("%g", AS_NUMBER(value));
             break;
         case VAL_OBJ:
-            printObject(value);
+            if (IS_INT(value)) {
+                char* chars = NULL;
+                int length = 0;
+                intToString(AS_INT(value), &chars, &length);
+                if (chars != NULL) {
+                    printf("%s", chars);
+                    tpMemFree(chars);
+                } else {
+                    printf("0");
+                }
+            } else {
+                printObject(value);
+            }
             break;
     }
 }
@@ -86,6 +113,16 @@ void printValueRepr(Value value) {
         case VAL_OBJ:
             if (IS_STRING(value)) {
                 printEscapedString(AS_STRING(value));
+            } else if (IS_INT(value)) {
+                char* chars = NULL;
+                int length = 0;
+                intToString(AS_INT(value), &chars, &length);
+                if (chars != NULL) {
+                    printf("%s", chars);
+                    tpMemFree(chars);
+                } else {
+                    printf("0");
+                }
             } else {
                 printObject(value);
             }
@@ -94,6 +131,9 @@ void printValueRepr(Value value) {
 }
 
 bool valuesEqual(Value a, Value b) {
+    if (IS_NUMBER(a) && IS_NUMBER(b)) {
+        return numericValue(a) == numericValue(b);
+    }
     if (a.type != b.type) return false;
     switch (a.type) {
         case VAL_BOOL:   return AS_BOOL(a) == AS_BOOL(b);
@@ -105,6 +145,12 @@ bool valuesEqual(Value a, Value b) {
                 ObjString* sb = AS_STRING(b);
                 return sa->length == sb->length &&
                        memcmp(sa->chars, sb->chars, sa->length) == 0;
+            }
+            if (IS_INT(a) && IS_INT(b)) {
+                ObjInt* ia = AS_INT(a);
+                ObjInt* ib = AS_INT(b);
+                if (ia->negative != ib->negative || ia->length != ib->length) return false;
+                return memcmp(ia->digits, ib->digits, sizeof(uint32_t) * (size_t)ia->length) == 0;
             }
             return AS_OBJ(a) == AS_OBJ(b);
         }

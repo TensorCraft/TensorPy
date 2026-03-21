@@ -1,0 +1,6 @@
+print(type(1))
+print(type(1.5))
+print(10**20 + 1)
+print(2**100)
+print(int("123456789012345678901234567890"))
+print(str(10**20 + 1))

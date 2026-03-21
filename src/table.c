@@ -34,6 +34,9 @@ static uint32_t hashValue(Value value) {
             if (IS_STRING(value)) {
                 return AS_STRING(value)->hash;
             }
+            if (IS_INT(value)) {
+                return intHash(AS_INT(value));
+            }
             // For other objects, use their memory address as a fallback
             return (uint32_t)(uintptr_t)AS_OBJ(value);
         }

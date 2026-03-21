@@ -341,6 +341,7 @@ static void markObject(Obj* object) {
     switch (object->type) {
         case OBJ_STRING:
         case OBJ_NATIVE:
+        case OBJ_INT:
         case OBJ_BYTES:
             return;
         case OBJ_DEVICE:
@@ -3103,9 +3104,38 @@ static InterpretResult run() {
                 push(NIL_VAL);
                 break;
             }
-            case OP_GREATER:  BINARY_OP(BOOL_VAL, >); break;
-            case OP_LESS:     BINARY_OP(BOOL_VAL, <); break;
+            case OP_GREATER: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* b = AS_INT(pop());
+                    ObjInt* a = AS_INT(pop());
+                    push(BOOL_VAL(intCompare(a, b) > 0));
+                } else {
+                    BINARY_OP(BOOL_VAL, >);
+                }
+                break;
+            }
+            case OP_LESS: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* b = AS_INT(pop());
+                    ObjInt* a = AS_INT(pop());
+                    push(BOOL_VAL(intCompare(a, b) < 0));
+                } else {
+                    BINARY_OP(BOOL_VAL, <);
+                }
+                break;
+            }
             case OP_ADD: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* b = AS_INT(pop());
+                    ObjInt* a = AS_INT(pop());
+                    ObjInt* result = intAdd(a, b);
+                    if (result == NULL) {
+                        runtimeError("Out of memory.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(OBJ_VAL(result));
+                    break;
+                }
                 if (IS_STRING(peek(0)) || IS_STRING(peek(1))) {
                     Value other = IS_STRING(peek(0)) ? peek(1) : peek(0);
                     
@@ -3152,8 +3182,33 @@ static InterpretResult run() {
                 }
                 break;
             }
-            case OP_SUBTRACT: BINARY_OP(NUMBER_VAL, -); break;
+            case OP_SUBTRACT: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* b = AS_INT(pop());
+                    ObjInt* a = AS_INT(pop());
+                    ObjInt* result = intSub(a, b);
+                    if (result == NULL) {
+                        runtimeError("Out of memory.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(OBJ_VAL(result));
+                    break;
+                }
+                BINARY_OP(NUMBER_VAL, -);
+                break;
+            }
             case OP_MULTIPLY: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* b = AS_INT(pop());
+                    ObjInt* a = AS_INT(pop());
+                    ObjInt* result = intMul(a, b);
+                    if (result == NULL) {
+                        runtimeError("Out of memory.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(OBJ_VAL(result));
+                    break;
+                }
                 if (IS_NUMBER(peek(0))) {
                     double count = AS_NUMBER(pop());
                     if (IS_LIST(peek(0))) {
@@ -3197,6 +3252,19 @@ static InterpretResult run() {
                 break;
             }
             case OP_MODULO: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* divisor = AS_INT(pop());
+                    ObjInt* dividend = AS_INT(pop());
+                    if (intIsZero(divisor)) {
+                        if (raiseException(createExceptionValue("ZeroDivisionError", "Division by zero."))) {
+                            HANDLE_RE();
+                        }
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    double result = fmod(intToDouble(dividend), intToDouble(divisor));
+                    push(NUMBER_VAL(result));
+                    break;
+                }
                 if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) {
                     runtimeError("Operands must be numbers.");
                     return INTERPRET_RUNTIME_ERROR;
@@ -3214,6 +3282,18 @@ static InterpretResult run() {
                 break;
             }
             case OP_FLOOR_DIVIDE: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* divisor = AS_INT(pop());
+                    ObjInt* dividend = AS_INT(pop());
+                    if (intIsZero(divisor)) {
+                        if (raiseException(createExceptionValue("ZeroDivisionError", "Division by zero."))) {
+                            HANDLE_RE();
+                        }
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(NUMBER_VAL(floor(intToDouble(dividend) / intToDouble(divisor))));
+                    break;
+                }
                 if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) {
                     runtimeError("Operands must be numbers.");
                     return INTERPRET_RUNTIME_ERROR;
@@ -3230,6 +3310,33 @@ static InterpretResult run() {
                 break;
             }
             case OP_POWER: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* exp = AS_INT(pop());
+                    ObjInt* base = AS_INT(pop());
+                    if (exp->negative) {
+                        push(NUMBER_VAL(pow(intToDouble(base), intToDouble(exp))));
+                        break;
+                    }
+                    ObjInt* result = newIntFromInt64(1);
+                    if (result == NULL) {
+                        runtimeError("Out of memory.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    vm.gcPauseDepth++;
+                    int64_t e = (int64_t)intToDouble(exp);
+                    for (int64_t i = 0; i < e; i++) {
+                        ObjInt* next = intMul(result, base);
+                        if (next == NULL) {
+                            runtimeError("Out of memory.");
+                            vm.gcPauseDepth--;
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        result = next;
+                    }
+                    vm.gcPauseDepth--;
+                    push(OBJ_VAL(result));
+                    break;
+                }
                 if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) {
                     runtimeError("Operands must be numbers.");
                     return INTERPRET_RUNTIME_ERROR;
@@ -3239,10 +3346,41 @@ static InterpretResult run() {
                 push(NUMBER_VAL(pow(a, b)));
                 break;
             }
-            case OP_BIT_AND: BITWISE_OP(&); break;
-            case OP_BIT_OR:  BITWISE_OP(|); break;
-            case OP_BIT_XOR: BITWISE_OP(^); break;
+            case OP_BIT_AND:
+            case OP_BIT_OR:
+            case OP_BIT_XOR: {
+                if (IS_INT(peek(0)) && IS_INT(peek(1))) {
+                    ObjInt* b = AS_INT(pop());
+                    ObjInt* a = AS_INT(pop());
+                    int64_t av = (int64_t)intToDouble(a);
+                    int64_t bv = (int64_t)intToDouble(b);
+                    int64_t out;
+                    if (instruction == OP_BIT_AND) out = av & bv;
+                    else if (instruction == OP_BIT_OR) out = av | bv;
+                    else out = av ^ bv;
+                    push(OBJ_VAL(newIntFromInt64(out)));
+                    break;
+                }
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) {
+                    runtimeError("Operands must be numbers.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                int64_t b = (int64_t)AS_NUMBER(pop());
+                int64_t a = (int64_t)AS_NUMBER(pop());
+                int64_t out;
+                if (instruction == OP_BIT_AND) out = a & b;
+                else if (instruction == OP_BIT_OR) out = a | b;
+                else out = a ^ b;
+                push(OBJ_VAL(newIntFromInt64(out)));
+                break;
+            }
             case OP_BIT_NOT: {
+                if (IS_INT(peek(0))) {
+                    ObjInt* value = AS_INT(pop());
+                    int64_t out = ~((int64_t)intToDouble(value));
+                    push(OBJ_VAL(newIntFromInt64(out)));
+                    break;
+                }
                 if (!IS_NUMBER(peek(0))) {
                     runtimeError("Operand must be a number.");
                     return INTERPRET_RUNTIME_ERROR;
@@ -3560,12 +3698,36 @@ static InterpretResult run() {
                 }
                 break;
             }
-            case OP_SHIFT_LEFT:  BITWISE_OP(<<); break;
-            case OP_SHIFT_RIGHT: BITWISE_OP(>>); break;
+            case OP_SHIFT_LEFT:
+            case OP_SHIFT_RIGHT: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) {
+                    runtimeError("Operands must be numbers.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                int64_t b = (int64_t)AS_NUMBER(pop());
+                int64_t a = (int64_t)AS_NUMBER(pop());
+                int64_t out = (instruction == OP_SHIFT_LEFT) ? (a << b) : (a >> b);
+                push(OBJ_VAL(newIntFromInt64(out)));
+                break;
+            }
             case OP_NOT:
                 push(BOOL_VAL(isFalsey(pop())));
                 break;
             case OP_NEGATE:
+                if (IS_INT(peek(0))) {
+                    ObjInt* value = AS_INT(pop());
+                    ObjInt* out = newIntCopy(value);
+                    if (out == NULL) {
+                        runtimeError("Out of memory.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    out->negative = !value->negative;
+                    if (intIsZero(out)) {
+                        out->negative = false;
+                    }
+                    push(OBJ_VAL(out));
+                    break;
+                }
                 if (!IS_NUMBER(peek(0))) {
                     runtimeError("Operand must be a number.");
                     return INTERPRET_RUNTIME_ERROR;

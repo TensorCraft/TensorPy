@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "tensorpy/object.h"
 #include "tensorpy/memory.h"
@@ -11,6 +12,8 @@
 // In a real implementation, we'd have a memory manager
 #define ALLOCATE_OBJ(type, objectType) \
     (type*)allocateObject(sizeof(type), objectType)
+
+static bool isZeroInt(const ObjInt* value);
 
 static Obj* allocateObject(size_t size, ObjType type) {
     if (vm.gcEnabled && vm.gcPauseDepth == 0 && vm.objectCount >= vm.nextGC) {
@@ -33,6 +36,261 @@ static uint32_t hashString(const char* key, int length) {
         hash *= 16777619;
     }
     return hash;
+}
+
+#define TP_INT_BASE 1000000000u
+
+static void trimInt(ObjInt* value) {
+    while (value->length > 1 && value->digits[value->length - 1] == 0) {
+        value->length--;
+    }
+    if (value->length == 1 && value->digits[0] == 0) {
+        value->negative = false;
+    }
+}
+
+static ObjInt* allocateInt(int length) {
+    ObjInt* value = ALLOCATE_OBJ(ObjInt, OBJ_INT);
+    value->negative = false;
+    value->length = length;
+    value->digits = (uint32_t*)tpMemCalloc((size_t)length, sizeof(uint32_t));
+    if (value->digits == NULL) {
+        tpMemFree(value);
+        return NULL;
+    }
+    return value;
+}
+
+static ObjInt* copyInt(const ObjInt* source) {
+    ObjInt* value = allocateInt(source->length);
+    if (value == NULL) {
+        return NULL;
+    }
+    value->negative = source->negative;
+    memcpy(value->digits, source->digits, sizeof(uint32_t) * (size_t)source->length);
+    return value;
+}
+
+static ObjInt* intFromUint64(uint64_t magnitude, bool negative) {
+    ObjInt* value;
+    int length = 0;
+    uint64_t temp = magnitude;
+
+    do {
+        length++;
+        temp /= TP_INT_BASE;
+    } while (temp != 0);
+
+    value = allocateInt(length);
+    if (value == NULL) {
+        return NULL;
+    }
+    value->negative = negative && magnitude != 0;
+    temp = magnitude;
+    for (int i = 0; i < length; i++) {
+        value->digits[i] = (uint32_t)(temp % TP_INT_BASE);
+        temp /= TP_INT_BASE;
+    }
+    trimInt(value);
+    return value;
+}
+
+static int compareAbsInt(const ObjInt* a, const ObjInt* b) {
+    if (a->length != b->length) {
+        return a->length < b->length ? -1 : 1;
+    }
+    for (int i = a->length - 1; i >= 0; i--) {
+        if (a->digits[i] != b->digits[i]) {
+            return a->digits[i] < b->digits[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+static ObjInt* addAbsInt(const ObjInt* a, const ObjInt* b) {
+    int max = a->length > b->length ? a->length : b->length;
+    ObjInt* out = allocateInt(max + 1);
+    uint64_t carry = 0;
+
+    if (out == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < max; i++) {
+        uint64_t sum = carry;
+        if (i < a->length) sum += a->digits[i];
+        if (i < b->length) sum += b->digits[i];
+        out->digits[i] = (uint32_t)(sum % TP_INT_BASE);
+        carry = sum / TP_INT_BASE;
+    }
+    out->digits[max] = (uint32_t)carry;
+    out->length = max + (carry != 0 ? 1 : 0);
+    trimInt(out);
+    return out;
+}
+
+static ObjInt* subAbsInt(const ObjInt* a, const ObjInt* b) {
+    ObjInt* out = allocateInt(a->length);
+    int64_t borrow = 0;
+
+    if (out == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < a->length; i++) {
+        int64_t diff = (int64_t)a->digits[i] - (i < b->length ? b->digits[i] : 0) - borrow;
+        if (diff < 0) {
+            diff += TP_INT_BASE;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out->digits[i] = (uint32_t)diff;
+    }
+    trimInt(out);
+    return out;
+}
+
+static ObjInt* mulAbsInt(const ObjInt* a, const ObjInt* b) {
+    int length = a->length + b->length;
+    uint64_t* accum = (uint64_t*)tpMemCalloc((size_t)length, sizeof(uint64_t));
+    ObjInt* out;
+
+    if (accum == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < a->length; i++) {
+        for (int j = 0; j < b->length; j++) {
+            accum[i + j] += (uint64_t)a->digits[i] * (uint64_t)b->digits[j];
+        }
+    }
+    out = allocateInt(length);
+    if (out == NULL) {
+        tpMemFree(accum);
+        return NULL;
+    }
+    uint64_t carry = 0;
+    for (int i = 0; i < length; i++) {
+        uint64_t cur = accum[i] + carry;
+        out->digits[i] = (uint32_t)(cur % TP_INT_BASE);
+        carry = cur / TP_INT_BASE;
+    }
+    tpMemFree(accum);
+    trimInt(out);
+    return out;
+}
+
+int intCompare(const ObjInt* a, const ObjInt* b) {
+    if (a->negative != b->negative) {
+        return a->negative ? -1 : 1;
+    }
+    int cmp = compareAbsInt(a, b);
+    return a->negative ? -cmp : cmp;
+}
+
+ObjInt* intAdd(const ObjInt* a, const ObjInt* b) {
+    if (a->negative == b->negative) {
+        ObjInt* out = addAbsInt(a, b);
+        if (out != NULL) out->negative = a->negative;
+        return out;
+    }
+    int cmp = compareAbsInt(a, b);
+    if (cmp == 0) {
+        return intFromUint64(0, false);
+    }
+    if (cmp > 0) {
+        ObjInt* out = subAbsInt(a, b);
+        if (out != NULL) out->negative = a->negative;
+        return out;
+    }
+    ObjInt* out = subAbsInt(b, a);
+    if (out != NULL) out->negative = b->negative;
+    return out;
+}
+
+ObjInt* intSub(const ObjInt* a, const ObjInt* b) {
+    ObjInt negB = *b;
+    negB.negative = !b->negative;
+    return intAdd(a, &negB);
+}
+
+ObjInt* intMul(const ObjInt* a, const ObjInt* b) {
+    ObjInt* out = mulAbsInt(a, b);
+    if (out != NULL) {
+        out->negative = (a->negative != b->negative) && !intIsZero(out);
+    }
+    return out;
+}
+
+uint32_t intHash(const ObjInt* value) {
+    uint32_t hash = value->negative ? 0x9e3779b9u : 0x7f4a7c15u;
+    for (int i = 0; i < value->length; i++) {
+        hash ^= value->digits[i] + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    }
+    return hash;
+}
+
+double intToDouble(const ObjInt* value) {
+    double result = 0.0;
+    double place = 1.0;
+
+    for (int i = 0; i < value->length; i++) {
+        result += (double)value->digits[i] * place;
+        place *= (double)TP_INT_BASE;
+    }
+    return value->negative ? -result : result;
+}
+
+static bool isZeroInt(const ObjInt* value) {
+    return value->length == 1 && value->digits[0] == 0;
+}
+
+bool intIsZero(const ObjInt* value) {
+    return isZeroInt(value);
+}
+
+static ObjInt* parseIntString(const char* chars, int length) {
+    int start = 0;
+    bool negative = false;
+    ObjInt* result = intFromUint64(0, false);
+
+    if (result == NULL) {
+        return NULL;
+    }
+    vm.gcPauseDepth++;
+    if (length > 0 && (chars[0] == '+' || chars[0] == '-')) {
+        negative = chars[0] == '-';
+        start = 1;
+    }
+    for (int i = start; i < length; i++) {
+        char c = chars[i];
+        if (c < '0' || c > '9') {
+            vm.gcPauseDepth--;
+            return NULL;
+        }
+        uint32_t digit = (uint32_t)(c - '0');
+        ObjInt* ten = intFromUint64(10, false);
+        ObjInt* digitInt = intFromUint64(digit, false);
+        ObjInt* tmp = mulAbsInt(result, ten);
+        ObjInt* next = addAbsInt(tmp, digitInt);
+        if (next == NULL) {
+            vm.gcPauseDepth--;
+            return NULL;
+        }
+        result = next;
+    }
+    result->negative = negative && !isZeroInt(result);
+    vm.gcPauseDepth--;
+    return result;
+}
+
+static void intToCString(const ObjInt* value, char* buffer, size_t size) {
+    int written = 0;
+    if (value->negative && !isZeroInt(value)) {
+        written += snprintf(buffer + written, size - (size_t)written, "-");
+    }
+    written += snprintf(buffer + written, size - (size_t)written, "%u", value->digits[value->length - 1]);
+    for (int i = value->length - 2; i >= 0; i--) {
+        written += snprintf(buffer + written, size - (size_t)written, "%09u", value->digits[i]);
+    }
 }
 
 static ObjString* allocateString(char* chars, int length, uint32_t hash) {
@@ -130,6 +388,11 @@ static void freeObject(Obj* object) {
         case OBJ_BYTES:
             tpMemFree(((ObjBytes*)object)->bytes);
             break;
+        case OBJ_INT: {
+            ObjInt* integer = (ObjInt*)object;
+            tpMemFree(integer->digits);
+            break;
+        }
         case OBJ_DEVICE:
         case OBJ_DTYPE:
             break;
@@ -186,6 +449,44 @@ ObjBytes* newBytes(int length, const uint8_t* source) {
         memcpy(bytes->bytes, source, length);
     }
     return bytes;
+}
+
+ObjInt* newIntFromInt64(int64_t value) {
+    uint64_t magnitude;
+    bool negative = value < 0;
+
+    if (value == 0) {
+        return intFromUint64(0, false);
+    }
+    magnitude = negative ? (uint64_t)(-(value + 1)) + 1u : (uint64_t)value;
+    return intFromUint64(magnitude, negative);
+}
+
+ObjInt* newIntFromString(const char* chars, int length) {
+    return parseIntString(chars, length);
+}
+
+ObjInt* newIntCopy(const ObjInt* source) {
+    return copyInt(source);
+}
+
+void intToString(const ObjInt* value, char** outChars, int* outLength) {
+    size_t size;
+    char* chars;
+
+    if (value == NULL || outChars == NULL || outLength == NULL) {
+        return;
+    }
+    size = (size_t)value->length * 10 + 2;
+    chars = (char*)tpMemAlloc(size);
+    if (chars == NULL) {
+        *outChars = NULL;
+        *outLength = 0;
+        return;
+    }
+    intToCString(value, chars, size);
+    *outLength = (int)strlen(chars);
+    *outChars = chars;
 }
 
 ObjSlice* newSlice(Value start, Value stop, Value step) {
@@ -448,7 +749,7 @@ bool getNativeObjectAttribute(Value object, ObjString* name, Value* result) {
             return true;
         }
         if (strcmp(name->chars, "kind") == 0) {
-            *result = OBJ_VAL(device->name);
+            *result = NUMBER_VAL((double)device->kind);
             return true;
         }
         return false;
@@ -470,11 +771,17 @@ bool getNativeObjectAttribute(Value object, ObjString* name, Value* result) {
             return true;
         }
         if (strcmp(name->chars, "rank") == 0) {
-            *result = NUMBER_VAL((double)tensor->rank);
+            {
+                ObjInt* integer = newIntFromInt64(tensor->rank);
+                *result = integer != NULL ? OBJ_VAL(integer) : NIL_VAL;
+            }
             return true;
         }
         if (strcmp(name->chars, "size") == 0) {
-            *result = NUMBER_VAL((double)tensor->size);
+            {
+                ObjInt* integer = newIntFromInt64(tensor->size);
+                *result = integer != NULL ? OBJ_VAL(integer) : NIL_VAL;
+            }
             return true;
         }
         if (strcmp(name->chars, "dtype") == 0) {
@@ -651,6 +958,19 @@ void printObject(Value value) {
                 printf("\\x%02x", b->bytes[i]);
             }
             printf("'");
+            break;
+        }
+        case OBJ_INT: {
+            ObjInt* integer = AS_INT(value);
+            size_t size = (size_t)integer->length * 10 + 2;
+            char* chars = (char*)malloc(size);
+            if (chars == NULL) {
+                printf("0");
+                break;
+            }
+            intToCString(integer, chars, size);
+            printf("%s", chars);
+            free(chars);
             break;
         }
         case OBJ_CLASS:

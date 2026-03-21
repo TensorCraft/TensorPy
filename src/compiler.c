@@ -1108,8 +1108,26 @@ static void grouping(bool canAssign) {
 
 static void number(bool canAssign) {
   (void)canAssign;
-  double value = strtod(parser.previous.start, NULL);
-  emitConstant(NUMBER_VAL(value));
+  bool isFloat = false;
+  for (int i = 0; i < parser.previous.length; i++) {
+    char c = parser.previous.start[i];
+    if (c == '.' || c == 'e' || c == 'E') {
+      isFloat = true;
+      break;
+    }
+  }
+  if (isFloat) {
+    double value = strtod(parser.previous.start, NULL);
+    emitConstant(NUMBER_VAL(value));
+  } else {
+    ObjInt* integer = newIntFromString(parser.previous.start, parser.previous.length);
+    if (integer == NULL) {
+      double value = strtod(parser.previous.start, NULL);
+      emitConstant(NUMBER_VAL(value));
+      return;
+    }
+    emitConstant(OBJ_VAL(integer));
+  }
 }
 
 static void unary(bool canAssign) {

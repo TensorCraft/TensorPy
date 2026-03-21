@@ -24,6 +24,7 @@ static bool valueMatchesTypeName(Value value, ObjString* name) {
 
     if (IS_BOOL(value)) return strcmp(typeName, "bool") == 0;
     if (IS_NIL(value)) return strcmp(typeName, "NoneType") == 0;
+    if (IS_INT(value)) return strcmp(typeName, "int") == 0;
     if (IS_NUMBER(value)) return strcmp(typeName, "float") == 0;
     if (!IS_OBJ(value)) return false;
 
@@ -1763,7 +1764,8 @@ static Value floatNative(int argCount, Value* args) {
     double value;
 
     if (argCount != 1) return NIL_VAL;
-    if (IS_NUMBER(args[0])) return args[0];
+    if (IS_NUMBER(args[0]) && !IS_INT(args[0])) return args[0];
+    if (IS_INT(args[0])) return NUMBER_VAL((double)intToDouble(AS_INT(args[0])));
     if (IS_BOOL(args[0])) return NUMBER_VAL(AS_BOOL(args[0]) ? 1.0 : 0.0);
     if (!IS_STRING(args[0])) return NIL_VAL;
 
@@ -1777,14 +1779,16 @@ static Value floatNative(int argCount, Value* args) {
 
 static Value intNative(int argCount, Value* args) {
     if (argCount != 1) return NIL_VAL;
-    if (IS_NUMBER(args[0])) return NUMBER_VAL((double)((int)AS_NUMBER(args[0])));
-    if (IS_BOOL(args[0])) return NUMBER_VAL(AS_BOOL(args[0]) ? 1.0 : 0.0);
+    if (IS_INT(args[0])) return args[0];
+    if (IS_NUMBER(args[0])) return OBJ_VAL(newIntFromInt64((int64_t)AS_NUMBER(args[0])));
+    if (IS_BOOL(args[0])) return OBJ_VAL(newIntFromInt64(AS_BOOL(args[0]) ? 1 : 0));
     if (IS_STRING(args[0])) {
-        Value parsed = floatNative(argCount, args);
-        if (IS_NIL(parsed)) {
+        ObjInt* parsed = newIntFromString(AS_CSTRING(args[0]), AS_STRING(args[0])->length);
+        if (parsed == NULL) {
+            vmRaiseExceptionMessage("ValueError", "could not convert string to int");
             return NIL_VAL;
         }
-        return NUMBER_VAL((double)((int)AS_NUMBER(parsed)));
+        return OBJ_VAL(parsed);
     }
     return NIL_VAL;
 }
@@ -1869,6 +1873,14 @@ static Value tupleNative(int argCount, Value* args) {
 // Built-in: abs()
 static Value absNative(int argCount, Value* args) {
     if (argCount != 1 || !IS_NUMBER(args[0])) return NIL_VAL;
+    if (IS_INT(args[0])) {
+        ObjInt* value = AS_INT(args[0]);
+        if (!value->negative) return args[0];
+        ObjInt* copy = newIntCopy(value);
+        if (copy == NULL) return NIL_VAL;
+        copy->negative = false;
+        return OBJ_VAL(copy);
+    }
     double val = AS_NUMBER(args[0]);
     return NUMBER_VAL(val < 0 ? -val : val);
 }
@@ -1934,6 +1946,15 @@ static Value strNative(int argCount, Value* args) {
     if (IS_STRING(args[0])) return args[0];
     
     if (IS_NUMBER(args[0])) {
+        if (IS_INT(args[0])) {
+            char* chars = NULL;
+            int length = 0;
+            intToString(AS_INT(args[0]), &chars, &length);
+            if (chars == NULL) return OBJ_VAL(copyString("0", 1));
+            Value result = OBJ_VAL(copyString(chars, length));
+            tpMemFree(chars);
+            return result;
+        }
         char buf[32];
         int len = sprintf(buf, "%g", AS_NUMBER(args[0]));
         return OBJ_VAL(copyString(buf, len));
@@ -1959,6 +1980,7 @@ static Value typeNative(int argCount, Value* args) {
         case VAL_NIL:    return OBJ_VAL(copyString("NoneType", 8));
         case VAL_NUMBER: return OBJ_VAL(copyString("float", 5));
         case VAL_OBJ: {
+            if (IS_INT(args[0])) return OBJ_VAL(copyString("int", 3));
             switch (OBJ_TYPE(args[0])) {
                 case OBJ_STRING:   return OBJ_VAL(copyString("str", 3));
                 case OBJ_NATIVE:   return OBJ_VAL(copyString("builtin_function_or_method", 26));
