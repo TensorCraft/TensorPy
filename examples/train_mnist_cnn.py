@@ -2,16 +2,21 @@ import csv
 import ml
 import nn
 import os
+import path
 
 
-TRAIN_PATH = "data/mnist/mnist_train_200.csv"
-TEST_PATH = "data/mnist/mnist_test_50.csv"
+TRAIN_PATH = "data/mnist/mnist_train_1000.csv"
+TEST_PATH = "data/mnist/mnist_test_200.csv"
+ARTIFACT_DIR = "artifacts/mnist_cnn"
+MODEL_PATH = path.join(ARTIFACT_DIR, "model.json")
+OPTIM_PATH = path.join(ARTIFACT_DIR, "adam.json")
 EPOCHS = 3
-LR = 0.01
+LR = 0.001
+NUM_CLASSES = 10
 
 
-def load_dataset(path):
-    rows = csv.read_rows(path)
+def load_dataset(csv_path):
+    rows = csv.read_rows(csv_path)
     images = []
     labels = []
 
@@ -20,14 +25,14 @@ def load_dataset(path):
         row = rows[i]
         label = int(row[0].strip())
         image = []
-        pixel_index = 1
+        pixel = 1
         y = 0
         while y < 28:
             line = []
             x = 0
             while x < 28:
-                line.append(float(row[pixel_index].strip()) / 255.0)
-                pixel_index = pixel_index + 1
+                line.append(float(row[pixel].strip()) / 255.0)
+                pixel = pixel + 1
                 x = x + 1
             image.append(line)
             y = y + 1
@@ -39,15 +44,15 @@ def load_dataset(path):
 
 
 def one_hot(label, classes):
-    values = []
+    out = []
     i = 0
     while i < classes:
         if i == label:
-            values.append(1.0)
+            out.append(1.0)
         else:
-            values.append(0.0)
+            out.append(0.0)
         i = i + 1
-    return [values]
+    return [out]
 
 
 def argmax(values):
@@ -62,25 +67,47 @@ def argmax(values):
     return best_index
 
 
+def build_model():
+    return nn.SimpleCNN(28, 1, 8, 3, NUM_CLASSES)
+
+
 def evaluate(model, images, labels):
+    total_loss = 0.0
     correct = 0
     i = 0
     while i < len(images):
-        logits = model.forward(ml.tensor([images[i]]))
-        predicted = argmax(logits.tolist()[0])
-        if predicted == labels[i]:
+        x = ml.tensor([images[i]])
+        target = ml.tensor(one_hot(labels[i], NUM_CLASSES))
+        logits = model.forward(x)
+        total_loss = total_loss + ml.mse_loss(logits, target).item()
+        if argmax(logits.tolist()[0]) == labels[i]:
             correct = correct + 1
         i = i + 1
-    return correct / len(images)
+
+    return {
+        "loss": total_loss / len(images),
+        "acc": correct / len(images),
+    }
 
 
-if not os.exists(TRAIN_PATH):
+def ensure_parent_dir(file_path):
+    directory = path.dirname(file_path)
+    if directory != "." and not os.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+
+
+def print_metrics(prefix, metrics):
+    print(prefix, "loss", metrics["loss"], "acc", metrics["acc"])
+
+
+if not os.exists(TRAIN_PATH) or not os.exists(TEST_PATH):
     raise RuntimeError("missing dataset: run scripts/prepare_mnist_csv.py first")
 
 train_images, train_labels = load_dataset(TRAIN_PATH)
 test_images, test_labels = load_dataset(TEST_PATH)
 
-model = nn.SimpleCNN(image_size=28, in_channels=1, conv_channels=4, kernel_size=3, num_classes=10)
+model = build_model()
+optim = nn.Adam(model.parameters(), lr=LR)
 
 epoch = 0
 while epoch < EPOCHS:
@@ -89,22 +116,49 @@ while epoch < EPOCHS:
     i = 0
     while i < len(train_images):
         x = ml.tensor([train_images[i]])
-        y = ml.tensor(one_hot(train_labels[i], 10))
+        target = ml.tensor(one_hot(train_labels[i], NUM_CLASSES))
 
-        model.zero_grad()
+        optim.zero_grad()
         logits = model.forward(x)
-        loss = ml.mse_loss(logits, y)
+        loss = ml.mse_loss(logits, target)
         loss.backward()
-        ml.sgd_step(model.parameters(), LR)
+        optim.step()
 
         total_loss = total_loss + loss.item()
         if argmax(logits.tolist()[0]) == train_labels[i]:
             correct = correct + 1
         i = i + 1
 
-    train_loss = total_loss / len(train_images)
-    train_acc = correct / len(train_images)
-    test_acc = evaluate(model, test_images, test_labels)
+    train_metrics = {
+        "loss": total_loss / len(train_images),
+        "acc": correct / len(train_images),
+    }
+    test_metrics = evaluate(model, test_images, test_labels)
 
-    print("epoch", epoch + 1, "loss", train_loss, "train_acc", train_acc, "test_acc", test_acc)
+    print("epoch", epoch + 1)
+    print_metrics("train", train_metrics)
+    print_metrics("test", test_metrics)
     epoch = epoch + 1
+
+ensure_parent_dir(MODEL_PATH)
+ensure_parent_dir(OPTIM_PATH)
+model.save(MODEL_PATH)
+optim.save(OPTIM_PATH)
+
+saved_metrics = evaluate(model, test_images, test_labels)
+print("saved", MODEL_PATH)
+print("saved", OPTIM_PATH)
+print_metrics("test_before_reload", saved_metrics)
+
+reloaded_model = build_model()
+reloaded_optim = nn.Adam(reloaded_model.parameters(), lr=LR)
+reloaded_model.load(MODEL_PATH)
+reloaded_optim.load(OPTIM_PATH)
+
+reloaded_metrics = evaluate(reloaded_model, test_images, test_labels)
+print_metrics("test_after_reload", reloaded_metrics)
+
+if abs(saved_metrics["acc"] - reloaded_metrics["acc"]) > 0.000001:
+    raise RuntimeError("reloaded model accuracy mismatch")
+
+print("mnist-cnn-save-load-ok")

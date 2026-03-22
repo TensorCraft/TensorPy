@@ -1,6 +1,8 @@
 import math
 import ml
 import random
+import io
+import json
 
 
 def _shape_product(shape):
@@ -48,6 +50,26 @@ def _is_module(value):
     return isinstance(value, Module)
 
 
+def _is_state_container(value):
+    if value == None:
+        return False
+    if _is_tensor(value) or _is_module(value):
+        return True
+    if _is_sequence(value):
+        i = 0
+        while i < len(value):
+            if _is_state_container(value[i]):
+                return True
+            i = i + 1
+        return False
+    if type(value) == "dict":
+        for key in value:
+            if _is_state_container(value[key]):
+                return True
+        return False
+    return False
+
+
 def _flatten_values(value, out):
     if _is_sequence(value):
         for item in value:
@@ -84,6 +106,14 @@ def _same_shape(left, right):
     return True
 
 
+def _sorted_keys(mapping):
+    keys = []
+    for key in mapping:
+        keys.append(key)
+    keys.sort()
+    return keys
+
+
 def _collect_parameters(value, out):
     if value == None:
         return
@@ -108,6 +138,264 @@ def _collect_parameters(value, out):
     if type(value) == "dict":
         for key in value:
             _collect_parameters(value[key], out)
+
+
+def _device_name(device):
+    if device == None:
+        return None
+    return device.name
+
+
+def _dtype_name(dtype):
+    if dtype == None:
+        return None
+    return dtype.name
+
+
+def _serialize_tensor(tensor):
+    return {
+        "kind": "tensor",
+        "shape": tensor.shape,
+        "dtype": _dtype_name(tensor.dtype),
+        "device": _device_name(tensor.device),
+        "requires_grad": tensor.requires_grad,
+        "data": tensor.tolist(),
+    }
+
+
+def _serialize_state_value(value):
+    if value == None:
+        return None
+    if _is_tensor(value):
+        return _serialize_tensor(value)
+    if _is_sequence(value):
+        out = []
+        i = 0
+        while i < len(value):
+            out.append(_serialize_state_value(value[i]))
+            i = i + 1
+        return out
+    if type(value) == "dict":
+        out = {}
+        for key in _sorted_keys(value):
+            out[str(key)] = _serialize_state_value(value[key])
+        return out
+    return value
+
+
+def _target_device_name(saved_device, map_location):
+    if map_location == None:
+        return saved_device
+    if type(map_location) == "device":
+        return map_location.name
+    return str(map_location)
+
+
+def _validate_parameter_device(target_device, requires_grad):
+    if requires_grad and target_device != None and target_device.name != "cpu":
+        raise RuntimeError("Trainable module parameters currently support only CPU devices.")
+
+
+def _deserialize_tensor(state, current=None, map_location=None):
+    target_dtype = None
+    target_device = None
+
+    if current != None:
+        target_dtype = current.dtype
+        if map_location == None:
+            target_device = current.device
+
+    if target_dtype == None and state.get("dtype") != None:
+        target_dtype = ml.dtype(state["dtype"])
+
+    device_name = _target_device_name(state.get("device"), map_location)
+    if target_device == None and device_name != None:
+        target_device = ml.device(device_name)
+
+    requires_grad = state.get("requires_grad")
+    if current != None and current.requires_grad:
+        requires_grad = True
+
+    _validate_parameter_device(target_device, requires_grad)
+
+    if requires_grad:
+        return ml.Parameter(state.get("data"), target_dtype, target_device)
+    return ml.tensor(state.get("data"), target_dtype, target_device)
+
+
+def _deserialize_state_value(state, current=None, map_location=None):
+    if state == None:
+        return None
+
+    if type(state) == "dict" and state.get("kind") == "tensor":
+        return _deserialize_tensor(state, current, map_location)
+
+    if type(state) == "list":
+        out = []
+        i = 0
+        while i < len(state):
+            current_item = None
+            if type(current) == "list" and i < len(current):
+                current_item = current[i]
+            out.append(_deserialize_state_value(state[i], current_item, map_location))
+            i = i + 1
+        return out
+
+    if type(state) == "dict":
+        out = {}
+        for key in _sorted_keys(state):
+            current_item = None
+            if type(current) == "dict" and key in current:
+                current_item = current[key]
+            out[key] = _deserialize_state_value(state[key], current_item, map_location)
+        return out
+
+    return state
+
+
+def _collect_state(value, prefix, out):
+    if value == None:
+        return
+
+    if _is_tensor(value):
+        out[prefix] = _serialize_tensor(value)
+        return
+
+    if _is_module(value):
+        for name in dir(value):
+            if name.startswith("__"):
+                continue
+            child = getattr(value, name)
+            if not _is_state_container(child):
+                continue
+            child_prefix = name
+            if prefix != "":
+                child_prefix = prefix + "." + name
+            _collect_state(child, child_prefix, out)
+        return
+
+    if _is_sequence(value):
+        i = 0
+        while i < len(value):
+            child = value[i]
+            if _is_state_container(child):
+                child_prefix = str(i)
+                if prefix != "":
+                    child_prefix = prefix + "." + child_prefix
+                _collect_state(child, child_prefix, out)
+            i = i + 1
+        return
+
+    if type(value) == "dict":
+        for key in _sorted_keys(value):
+            child = value[key]
+            if _is_state_container(child):
+                child_prefix = str(key)
+                if prefix != "":
+                    child_prefix = prefix + "." + child_prefix
+                _collect_state(child, child_prefix, out)
+
+
+def _load_state(value, prefix, state, map_location, missing, loaded):
+    if value == None:
+        return value
+
+    if _is_tensor(value):
+        if not (prefix in state):
+            missing.append(prefix)
+            return value
+        loaded.append(prefix)
+        return _deserialize_tensor(state[prefix], value, map_location)
+
+    if _is_module(value):
+        for name in dir(value):
+            if name.startswith("__"):
+                continue
+            child = getattr(value, name)
+            if not _is_state_container(child):
+                continue
+            child_prefix = name
+            if prefix != "":
+                child_prefix = prefix + "." + name
+            updated = _load_state(child, child_prefix, state, map_location, missing, loaded)
+            if updated != child:
+                setattr(value, name, updated)
+        return value
+
+    if type(value) == "list":
+        i = 0
+        while i < len(value):
+            child = value[i]
+            if _is_state_container(child):
+                child_prefix = str(i)
+                if prefix != "":
+                    child_prefix = prefix + "." + child_prefix
+                value[i] = _load_state(child, child_prefix, state, map_location, missing, loaded)
+            i = i + 1
+        return value
+
+    if type(value) == "tuple":
+        raise ValueError("Tuple-backed state containers are not supported.")
+
+    if type(value) == "dict":
+        for key in value:
+            child = value[key]
+            if _is_state_container(child):
+                child_prefix = str(key)
+                if prefix != "":
+                    child_prefix = prefix + "." + child_prefix
+                value[key] = _load_state(child, child_prefix, state, map_location, missing, loaded)
+        return value
+
+    return value
+
+
+def _move_state_value(value, device):
+    if value == None:
+        return value
+
+    if _is_tensor(value):
+        target_device = device
+        if type(device) != "device":
+            target_device = ml.device(str(device))
+        _validate_parameter_device(target_device, value.requires_grad)
+        moved = value.to(device)
+        if value.requires_grad:
+            return ml.Parameter(moved.tolist(), moved.dtype, moved.device)
+        return moved
+
+    if _is_module(value):
+        for name in dir(value):
+            if name.startswith("__"):
+                continue
+            child = getattr(value, name)
+            if not _is_state_container(child):
+                continue
+            updated = _move_state_value(child, device)
+            if updated != child:
+                setattr(value, name, updated)
+        return value
+
+    if type(value) == "list":
+        i = 0
+        while i < len(value):
+            child = value[i]
+            if _is_state_container(child):
+                value[i] = _move_state_value(child, device)
+            i = i + 1
+        return value
+
+    if type(value) == "tuple":
+        raise ValueError("Tuple-backed state containers are not supported.")
+
+    if type(value) == "dict":
+        for key in value:
+            child = value[key]
+            if _is_state_container(child):
+                value[key] = _move_state_value(child, device)
+        return value
+
+    return value
 
 
 def _normalize_indices(indices):
@@ -246,6 +534,48 @@ def _run_recurrent_sequence(cell, x, initial_state, batch_first):
 
 
 class Module:
+
+    def state_dict(self):
+        out = {}
+        _collect_state(self, "", out)
+        return out
+
+    def load_state_dict(self, state, map_location=None, strict=True):
+        missing = []
+        loaded = []
+        _load_state(self, "", state, map_location, missing, loaded)
+
+        unexpected = []
+        for key in _sorted_keys(state):
+            if key not in loaded:
+                unexpected.append(key)
+
+        if strict and len(missing) > 0:
+            raise ValueError("Missing state keys: " + ", ".join(missing))
+        if strict and len(unexpected) > 0:
+            raise ValueError("Unexpected state keys: " + ", ".join(unexpected))
+        return {
+            "missing_keys": missing,
+            "unexpected_keys": unexpected,
+        }
+
+    def save(self, path):
+        payload = {
+            "format": "tensorpy.nn.state_dict.v1",
+            "state": self.state_dict(),
+        }
+        io.write_text(path, json.dumps(payload))
+        return path
+
+    def load(self, path, map_location=None, strict=True):
+        payload = json.loads(io.read_text(path))
+        if type(payload) != "dict" or payload.get("format") != "tensorpy.nn.state_dict.v1":
+            raise ValueError("Invalid TensorPy model checkpoint.")
+        return self.load_state_dict(payload.get("state"), map_location, strict)
+
+    def to(self, device):
+        _move_state_value(self, device)
+        return self
 
     def parameters(self):
         params = []
@@ -600,6 +930,76 @@ class Adam:
         self.step_count = self.step_count + 1
         ml.adam_step(self.params, self.m, self.v, self.lr, self.beta1, self.beta2, self.eps, self.step_count)
 
+    def state_dict(self):
+        return {
+            "lr": self.lr,
+            "beta1": self.beta1,
+            "beta2": self.beta2,
+            "eps": self.eps,
+            "step_count": self.step_count,
+            "m": _serialize_state_value(self.m),
+            "v": _serialize_state_value(self.v),
+        }
+
+    def load_state_dict(self, state, map_location=None, strict=True):
+        missing = []
+        expected = ["lr", "beta1", "beta2", "eps", "step_count", "m", "v"]
+        i = 0
+        while i < len(expected):
+            key = expected[i]
+            if key not in state:
+                missing.append(key)
+            i = i + 1
+
+        unexpected = []
+        for key in _sorted_keys(state):
+            if key not in expected:
+                unexpected.append(key)
+
+        if strict and len(missing) > 0:
+            raise ValueError("Missing optimizer state keys: " + ", ".join(missing))
+        if strict and len(unexpected) > 0:
+            raise ValueError("Unexpected optimizer state keys: " + ", ".join(unexpected))
+
+        if "lr" in state:
+            self.lr = state["lr"]
+        if "beta1" in state:
+            self.beta1 = state["beta1"]
+        if "beta2" in state:
+            self.beta2 = state["beta2"]
+        if "eps" in state:
+            self.eps = state["eps"]
+        if "step_count" in state:
+            self.step_count = int(state["step_count"])
+        if "m" in state:
+            self.m = _deserialize_state_value(state["m"], self.m, map_location)
+        if "v" in state:
+            self.v = _deserialize_state_value(state["v"], self.v, map_location)
+
+        if strict and len(self.m) != len(self.params):
+            raise ValueError("Optimizer state does not match parameter count.")
+        if strict and len(self.v) != len(self.params):
+            raise ValueError("Optimizer state does not match parameter count.")
+
+        return {
+            "missing_keys": missing,
+            "unexpected_keys": unexpected,
+        }
+
+    def save(self, path):
+        payload = {
+            "format": "tensorpy.nn.adam.v1",
+            "state": self.state_dict(),
+        }
+        io.write_text(path, json.dumps(payload))
+        return path
+
+    def load(self, path, map_location=None, strict=True):
+        payload = json.loads(io.read_text(path))
+        if type(payload) != "dict" or payload.get("format") != "tensorpy.nn.adam.v1":
+            raise ValueError("Invalid TensorPy Adam checkpoint.")
+        return self.load_state_dict(payload.get("state"), map_location, strict)
+
 
 class LogisticRegression(Module):
 
@@ -638,3 +1038,15 @@ class SimpleCNN(Module):
     def forward(self, x):
         x = self.features.forward(x)
         return self.classifier.forward(x)
+
+
+def save(module, path):
+    if not _is_module(module) and not isinstance(module, Adam):
+        raise TypeError("save() expects an nn.Module or nn.Adam.")
+    return module.save(path)
+
+
+def load(module, path, map_location=None, strict=True):
+    if not _is_module(module) and not isinstance(module, Adam):
+        raise TypeError("load() expects an nn.Module or nn.Adam.")
+    return module.load(path, map_location, strict)
