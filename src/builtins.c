@@ -3,6 +3,13 @@
 #include <math.h>
 #include <stdlib.h>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#define TP_HAS_ACCELERATE 1
+#else
+#define TP_HAS_ACCELERATE 0
+#endif
+
 #include "tensorpy/common.h"
 #include "tensorpy/memory.h"
 #include "tensorpy/object.h"
@@ -16,8 +23,54 @@ static bool syncTensorFromMetal(ObjTensor* tensor);
 static ObjTensor* newScalarTensor(float value, ObjDevice* device);
 static bool setAutogradBinary(ObjTensor* out, ObjTensor* a, ObjTensor* b, TPAutogradOp op);
 static bool setAutogradUnary(ObjTensor* out, ObjTensor* input, TPAutogradOp op);
-static Value tensorConv2d(Value inputValue, Value weightValue);
+static Value tensorMatmul(Value left, Value right, Value biasValue);
+static Value tensorConv2d(Value inputValue, Value weightValue, Value biasValue, bool applyRelu);
 static Value tensorToListValue(ObjTensor* tensor);
+static Value mlLoadMnistCsvNative(int argCount, Value* args);
+static Value csvLoadsNative(int argCount, Value* args);
+static Value csvReadRowsNative(int argCount, Value* args);
+static Value csvReadDictsNative(int argCount, Value* args);
+static void tensorConv2dRangeTask(int start, int end, void* context);
+static void tensorUnaryRangeTask(int start, int end, void* context);
+static bool tensorConv2dAccelerateInference(const ObjTensor* input,
+                                            const ObjTensor* weight,
+                                            const ObjTensor* bias,
+                                            ObjTensor* out,
+                                            int inChannels,
+                                            int inHeight,
+                                            int inWidth,
+                                            int outChannels,
+                                            int outHeight,
+                                            int outWidth,
+                                            int kernelHeight,
+                                            int kernelWidth,
+                                            bool applyRelu);
+
+typedef struct {
+    const ObjTensor* input;
+    const ObjTensor* weight;
+    ObjTensor* out;
+    int inChannels;
+    int inHeight;
+    int inWidth;
+    int outChannels;
+    int outHeight;
+    int outWidth;
+    int kernelHeight;
+    int kernelWidth;
+    int inputBatchStride;
+    int inputChannelStride;
+    int outputBatchStride;
+    int outputChannelStride;
+    int weightOutStride;
+    int weightChannelStride;
+} TPConv2dTask;
+
+typedef struct {
+    const ObjTensor* input;
+    ObjTensor* out;
+    int op;
+} TPTensorUnaryTask;
 
 static bool valueMatchesTypeName(Value value, ObjString* name) {
     const char* typeName = name->chars;
@@ -510,6 +563,37 @@ static bool canRunMetalScalarElementwise(const ObjTensor* tensor) {
            tensor->metalBuffer != NULL;
 }
 
+static bool tensorBiasAsVector(const ObjTensor* bias, int expected, const float** outData) {
+    if (bias == NULL || outData == NULL) {
+        return false;
+    }
+    if (bias->rank == 1 && bias->shape[0] == expected) {
+        *outData = bias->data;
+        return true;
+    }
+    if (bias->rank == 2 && bias->shape[0] == 1 && bias->shape[1] == expected) {
+        *outData = bias->data;
+        return true;
+    }
+    if (bias->rank == 4 &&
+        bias->shape[0] == 1 &&
+        bias->shape[1] == expected &&
+        bias->shape[2] == 1 &&
+        bias->shape[3] == 1) {
+        *outData = bias->data;
+        return true;
+    }
+    return false;
+}
+
+static bool tensorBiasMatchesMetal2D(const ObjTensor* bias, int cols) {
+    return bias != NULL &&
+           bias->device->kind == TP_DEVICE_METAL &&
+           bias->metalBuffer != NULL &&
+           ((bias->rank == 1 && bias->shape[0] == cols) ||
+            (bias->rank == 2 && bias->shape[0] == 1 && bias->shape[1] == cols));
+}
+
 static float applyBinaryScalar(float a, float b, TPTensorBinaryOp op) {
     switch (op) {
         case TP_TENSOR_BINARY_ADD: return a + b;
@@ -535,6 +619,14 @@ static float applyUnaryScalar(float x, TPTensorUnaryOp op) {
         }
     }
     return x;
+}
+
+static void tensorUnaryRangeTask(int start, int end, void* context) {
+    TPTensorUnaryTask* task = (TPTensorUnaryTask*)context;
+    int i;
+    for (i = start; i < end; i++) {
+        task->out->data[i] = applyUnaryScalar(task->input->data[i], (TPTensorUnaryOp)task->op);
+    }
 }
 
 static ObjTensor* tensorBinaryTensorOp(const ObjTensor* a,
@@ -748,18 +840,47 @@ static Value mlBinaryOp(Value left, Value right, TPTensorBinaryOp op) {
 
 static ObjTensor* tensorUnaryOp(const ObjTensor* tensor, TPTensorUnaryOp op) {
     ObjTensor* out = createTensorLike(tensor);
+    TPTensorUnaryTask task;
     int i;
 
     if (out == NULL) {
         vmRaiseExceptionMessage("RuntimeError", "Out of memory while creating tensor.");
         return NULL;
     }
+    if (op == TP_TENSOR_UNARY_RELU &&
+        canRunMetalScalarElementwise(tensor) &&
+        tpMetalReluF32(vm.metalBackend, tensor->metalBuffer, out->metalBuffer, tensor->size)) {
+        out->cpuDirty = true;
+        out->metalDirty = false;
+        if (!setAutogradUnary(out,
+                              (ObjTensor*)tensor,
+                              TP_AUTOGRAD_RELU)) {
+            return NULL;
+        }
+        return out;
+    }
     if (!syncTensorFromMetal((ObjTensor*)tensor)) {
         vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
         return NULL;
     }
-    for (i = 0; i < tensor->size; i++) {
-        out->data[i] = applyUnaryScalar(tensor->data[i], op);
+    task.input = tensor;
+    task.out = out;
+    task.op = (int)op;
+    if (tensor->size >= vm.compute.parallelThreshold &&
+        vm.compute.pool != NULL &&
+        vm.compute.threadCount > 1) {
+        int grain = tensor->size / (vm.compute.threadCount * 4);
+        if (grain < 1024) {
+            grain = 1024;
+        }
+        if (!platformThreadPoolParallelFor(vm.compute.pool, 0, tensor->size, grain, tensorUnaryRangeTask, &task)) {
+            vmRaiseExceptionMessage("RuntimeError", "unary op parallel execution failed.");
+            return NULL;
+        }
+    } else {
+        for (i = 0; i < tensor->size; i++) {
+            out->data[i] = applyUnaryScalar(tensor->data[i], op);
+        }
     }
     syncTensorToMetal(out);
     if (!setAutogradUnary(out,
@@ -804,9 +925,10 @@ static Value tensorReduceNumber(const ObjTensor* tensor, const char* kind) {
     return NUMBER_VAL((double)result);
 }
 
-static Value tensorMatmul(Value left, Value right) {
+static Value tensorMatmul(Value left, Value right, Value biasValue) {
     ObjTensor* a;
     ObjTensor* b;
+    ObjTensor* bias = NULL;
     ObjTensor* out;
     bool useMetal;
     int i;
@@ -820,8 +942,19 @@ static Value tensorMatmul(Value left, Value right) {
 
     a = AS_TENSOR(left);
     b = AS_TENSOR(right);
+    if (!IS_NIL(biasValue)) {
+        if (!IS_TENSOR(biasValue)) {
+            vmRaiseExceptionMessage("TypeError", "matmul() optional bias must be a tensor.");
+            return NIL_VAL;
+        }
+        bias = AS_TENSOR(biasValue);
+    }
 
     if (a->rank == 1 && b->rank == 1) {
+        if (bias != NULL) {
+            vmRaiseExceptionMessage("ValueError", "matmul() bias is supported only for 2D x 2D matmul.");
+            return NIL_VAL;
+        }
         float dot;
         if (!syncTensorFromMetal(a) || !syncTensorFromMetal(b)) {
             vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
@@ -848,8 +981,13 @@ static Value tensorMatmul(Value left, Value right) {
 
     if (a->rank == 2 && b->rank == 2) {
         int shape[2];
+        const float* biasData = NULL;
         if (a->shape[1] != b->shape[0]) {
             vmRaiseExceptionMessage("ValueError", "matmul() dimension mismatch.");
+            return NIL_VAL;
+        }
+        if (bias != NULL && !tensorBiasAsVector(bias, b->shape[1], &biasData)) {
+            vmRaiseExceptionMessage("ValueError", "matmul() bias must have shape [P] or [1,P].");
             return NIL_VAL;
         }
         useMetal = (a->device->kind == TP_DEVICE_METAL || b->device->kind == TP_DEVICE_METAL) &&
@@ -876,13 +1014,89 @@ static Value tensorMatmul(Value left, Value right) {
                              a->shape[0],
                              a->shape[1],
                              b->shape[1])) {
-            out->cpuDirty = true;
-            out->metalDirty = false;
+            bool biasOk = true;
+            if (bias != NULL) {
+                biasOk = tensorBiasMatchesMetal2D(bias, b->shape[1]) &&
+                         tpMetalAddBias2DF32(vm.metalBackend,
+                                             out->metalBuffer,
+                                             bias->metalBuffer,
+                                             out->metalBuffer,
+                                             a->shape[0],
+                                             b->shape[1]);
+            }
+            if (!biasOk) {
+                if (!syncTensorFromMetal(a) || !syncTensorFromMetal(b) || !syncTensorFromMetal(out)) {
+                    vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+                    return NIL_VAL;
+                }
+                if (bias != NULL && !syncTensorFromMetal(bias)) {
+                    vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+                    return NIL_VAL;
+                }
+#if TP_HAS_ACCELERATE
+                cblas_sgemm(CblasRowMajor,
+                            CblasNoTrans,
+                            CblasNoTrans,
+                            a->shape[0],
+                            b->shape[1],
+                            a->shape[1],
+                            1.0f,
+                            a->data,
+                            a->shape[1],
+                            b->data,
+                            b->shape[1],
+                            0.0f,
+                            out->data,
+                            b->shape[1]);
+#else
+                for (i = 0; i < shape[0]; i++) {
+                    for (j = 0; j < shape[1]; j++) {
+                        float total = 0.0f;
+                        for (k = 0; k < a->shape[1]; k++) {
+                            total += a->data[i * a->shape[1] + k] * b->data[k * b->shape[1] + j];
+                        }
+                        out->data[i * shape[1] + j] = total;
+                    }
+                }
+#endif
+                if (bias != NULL) {
+                    for (i = 0; i < shape[0]; i++) {
+                        float* outRow = out->data + i * shape[1];
+                        for (j = 0; j < shape[1]; j++) {
+                            outRow[j] += biasData[j];
+                        }
+                    }
+                }
+                syncTensorToMetal(out);
+            } else {
+                out->cpuDirty = true;
+                out->metalDirty = false;
+            }
         } else {
             if (!syncTensorFromMetal(a) || !syncTensorFromMetal(b)) {
                 vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
                 return NIL_VAL;
             }
+            if (bias != NULL && !syncTensorFromMetal(bias)) {
+                vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+                return NIL_VAL;
+            }
+#if TP_HAS_ACCELERATE
+            cblas_sgemm(CblasRowMajor,
+                        CblasNoTrans,
+                        CblasNoTrans,
+                        a->shape[0],
+                        b->shape[1],
+                        a->shape[1],
+                        1.0f,
+                        a->data,
+                        a->shape[1],
+                        b->data,
+                        b->shape[1],
+                        0.0f,
+                        out->data,
+                        b->shape[1]);
+#else
             for (i = 0; i < shape[0]; i++) {
                 for (j = 0; j < shape[1]; j++) {
                     float total = 0.0f;
@@ -892,12 +1106,26 @@ static Value tensorMatmul(Value left, Value right) {
                     out->data[i * shape[1] + j] = total;
                 }
             }
+#endif
+            if (bias != NULL) {
+                for (i = 0; i < shape[0]; i++) {
+                    float* outRow = out->data + i * shape[1];
+                    for (j = 0; j < shape[1]; j++) {
+                        outRow[j] += biasData[j];
+                    }
+                }
+            }
             syncTensorToMetal(out);
         }
         if (!setAutogradBinary(out, a, b, TP_AUTOGRAD_MATMUL)) {
             return NIL_VAL;
         }
         return OBJ_VAL(out);
+    }
+
+    if (bias != NULL) {
+        vmRaiseExceptionMessage("ValueError", "matmul() bias is supported only for 2D x 2D matmul.");
+        return NIL_VAL;
     }
 
     if (a->rank == 2 && b->rank == 1) {
@@ -1554,10 +1782,18 @@ static bool backwardTensorNode(ObjTensor* out) {
             int batch;
             int outChannels;
             int inChannels;
+            int inputHeight;
+            int inputWidth;
             int outHeight;
             int outWidth;
             int kernelHeight;
             int kernelWidth;
+            int inputBatchStride;
+            int inputChannelStride;
+            int outputBatchStride;
+            int outputChannelStride;
+            int weightOutStride;
+            int weightChannelStride;
             int n;
             int oc;
             int ic;
@@ -1572,25 +1808,39 @@ static bool backwardTensorNode(ObjTensor* out) {
 
             batch = input->shape[0];
             inChannels = input->shape[1];
+            inputHeight = input->shape[2];
+            inputWidth = input->shape[3];
             outChannels = weight->shape[0];
             kernelHeight = weight->shape[2];
             kernelWidth = weight->shape[3];
             outHeight = out->shape[2];
             outWidth = out->shape[3];
+            inputChannelStride = inputHeight * inputWidth;
+            inputBatchStride = inChannels * inputChannelStride;
+            outputChannelStride = outHeight * outWidth;
+            outputBatchStride = outChannels * outputChannelStride;
+            weightChannelStride = kernelHeight * kernelWidth;
+            weightOutStride = inChannels * weightChannelStride;
 
             if (input->requiresGrad) {
                 if (!ensureTensorGrad(input)) return false;
                 for (n = 0; n < batch; n++) {
+                    float* gradBatch = grad->data + n * outputBatchStride;
+                    float* inputGradBatch = input->grad->data + n * inputBatchStride;
                     for (oc = 0; oc < outChannels; oc++) {
+                        float* weightOut = weight->data + oc * weightOutStride;
+                        float* gradChannel = gradBatch + oc * outputChannelStride;
                         for (oy = 0; oy < outHeight; oy++) {
                             for (ox = 0; ox < outWidth; ox++) {
-                                float go = grad->data[((n * outChannels + oc) * outHeight + oy) * outWidth + ox];
+                                float go = gradChannel[oy * outWidth + ox];
                                 for (ic = 0; ic < inChannels; ic++) {
+                                    float* inputGradChannel = inputGradBatch + ic * inputChannelStride;
+                                    float* weightChannel = weightOut + ic * weightChannelStride;
                                     for (ky = 0; ky < kernelHeight; ky++) {
+                                        float* inputGradRow = inputGradChannel + (oy + ky) * inputWidth + ox;
+                                        float* weightRow = weightChannel + ky * kernelWidth;
                                         for (kx = 0; kx < kernelWidth; kx++) {
-                                            int inIndex = ((n * inChannels + ic) * input->shape[2] + (oy + ky)) * input->shape[3] + (ox + kx);
-                                            int wIndex = ((oc * inChannels + ic) * kernelHeight + ky) * kernelWidth + kx;
-                                            input->grad->data[inIndex] += go * weight->data[wIndex];
+                                            inputGradRow[kx] += go * weightRow[kx];
                                         }
                                     }
                                 }
@@ -1603,20 +1853,26 @@ static bool backwardTensorNode(ObjTensor* out) {
             if (weight->requiresGrad) {
                 if (!ensureTensorGrad(weight)) return false;
                 for (oc = 0; oc < outChannels; oc++) {
+                    float* weightGradOut = weight->grad->data + oc * weightOutStride;
                     for (ic = 0; ic < inChannels; ic++) {
+                        float* weightGradChannel = weightGradOut + ic * weightChannelStride;
                         for (ky = 0; ky < kernelHeight; ky++) {
                             for (kx = 0; kx < kernelWidth; kx++) {
                                 float total = 0.0f;
                                 for (n = 0; n < batch; n++) {
+                                    float* inputBatch = input->data + n * inputBatchStride;
+                                    float* gradBatch = grad->data + n * outputBatchStride;
+                                    float* inputChannel = inputBatch + ic * inputChannelStride;
+                                    float* gradChannel = gradBatch + oc * outputChannelStride;
                                     for (oy = 0; oy < outHeight; oy++) {
+                                        float* inputRow = inputChannel + (oy + ky) * inputWidth + kx;
+                                        float* gradRow = gradChannel + oy * outWidth;
                                         for (ox = 0; ox < outWidth; ox++) {
-                                            int inIndex = ((n * inChannels + ic) * input->shape[2] + (oy + ky)) * input->shape[3] + (ox + kx);
-                                            int outIndex = ((n * outChannels + oc) * outHeight + oy) * outWidth + ox;
-                                            total += input->data[inIndex] * grad->data[outIndex];
+                                            total += inputRow[ox] * gradRow[ox];
                                         }
                                     }
                                 }
-                                weight->grad->data[((oc * inChannels + ic) * kernelHeight + ky) * kernelWidth + kx] += total;
+                                weightGradChannel[ky * kernelWidth + kx] += total;
                             }
                         }
                     }
@@ -2441,6 +2697,17 @@ static Value mlMetalAvailableNative(int argCount, Value* args) {
     return BOOL_VAL(tpMetalBackendIsAvailable(vm.metalBackend));
 }
 
+static Value mlMetalErrorNative(int argCount, Value* args) {
+    const char* error;
+    (void)args;
+    if (argCount != 0) return NIL_VAL;
+    error = tpMetalBackendLastError(vm.metalBackend);
+    if (error == NULL) {
+        return NIL_VAL;
+    }
+    return OBJ_VAL(copyString(error, (int)strlen(error)));
+}
+
 static Value mlTensorNative(int argCount, Value* args) {
     ObjDType* dtype;
     ObjDevice* device;
@@ -2618,12 +2885,14 @@ static Value mlReshapeNative(int argCount, Value* args) {
         return NIL_VAL;
     }
 
-    result = newTensor(rank, shape, tensor->dtype, tensor->device, tensor->data);
+    result = newTensorView(rank, shape, tensor->dtype, tensor->device, tensor->data, tensor->metalBuffer);
     free(shape);
     if (result == NULL) {
         vmRaiseExceptionMessage("RuntimeError", "Out of memory while reshaping tensor.");
         return NIL_VAL;
     }
+    result->cpuDirty = tensor->cpuDirty;
+    result->metalDirty = tensor->metalDirty;
     if (tensor->requiresGrad) {
         if (!ensureAutogradSupported(tensor) || !ensureAutogradSupported(result)) {
             return NIL_VAL;
@@ -2692,13 +2961,18 @@ static Value mlMaxNative(int argCount, Value* args) {
 }
 
 static Value mlMatmulNative(int argCount, Value* args) {
-    if (argCount != 2) return NIL_VAL;
-    return tensorMatmul(args[0], args[1]);
+    if (argCount != 2 && argCount != 3) return NIL_VAL;
+    return tensorMatmul(args[0], args[1], argCount == 3 ? args[2] : NIL_VAL);
 }
 
 static Value mlConv2dNative(int argCount, Value* args) {
-    if (argCount != 2) return NIL_VAL;
-    return tensorConv2d(args[0], args[1]);
+    bool applyRelu = false;
+    if (argCount < 2 || argCount > 4) return NIL_VAL;
+    if (argCount == 4) {
+        if (!IS_BOOL(args[3])) return NIL_VAL;
+        applyRelu = AS_BOOL(args[3]);
+    }
+    return tensorConv2d(args[0], args[1], argCount >= 3 ? args[2] : NIL_VAL, applyRelu);
 }
 
 static Value mlToListNative(int argCount, Value* args) {
@@ -2812,10 +3086,13 @@ static Value mlMseLossNative(int argCount, Value* args) {
     return OBJ_VAL(loss);
 }
 
-static Value tensorConv2d(Value inputValue, Value weightValue) {
+static Value tensorConv2d(Value inputValue, Value weightValue, Value biasValue, bool applyRelu) {
     ObjTensor* input;
     ObjTensor* weight;
+    ObjTensor* bias = NULL;
     ObjTensor* out;
+    TPConv2dTask task;
+    const float* biasData = NULL;
     int outShape[4];
     int batch;
     int inChannels;
@@ -2827,13 +3104,14 @@ static Value tensorConv2d(Value inputValue, Value weightValue) {
     int kernelWidth;
     int outHeight;
     int outWidth;
-    int n;
-    int oc;
-    int oy;
-    int ox;
-    int ic;
-    int ky;
-    int kx;
+    int inputBatchStride;
+    int inputChannelStride;
+    int outputBatchStride;
+    int outputChannelStride;
+    int weightOutStride;
+    int weightChannelStride;
+    bool canUseMetalKernel;
+    bool usedAccelerateInference = false;
 
     if (!IS_TENSOR(inputValue) || !IS_TENSOR(weightValue)) {
         vmRaiseExceptionMessage("TypeError", "conv2d() expects two tensors.");
@@ -2842,13 +3120,29 @@ static Value tensorConv2d(Value inputValue, Value weightValue) {
 
     input = AS_TENSOR(inputValue);
     weight = AS_TENSOR(weightValue);
+    if (!IS_NIL(biasValue)) {
+        if (!IS_TENSOR(biasValue)) {
+            vmRaiseExceptionMessage("TypeError", "conv2d() optional bias must be a tensor.");
+            return NIL_VAL;
+        }
+        bias = AS_TENSOR(biasValue);
+    }
 
     if (input->rank != 4 || weight->rank != 4) {
         vmRaiseExceptionMessage("ValueError", "conv2d() currently expects input [N,C,H,W] and weight [O,C,KH,KW].");
         return NIL_VAL;
     }
-    if (!tensorOnCpuForTraining(input) || !tensorOnCpuForTraining(weight)) {
-        vmRaiseExceptionMessage("RuntimeError", "conv2d() currently supports only CPU tensors.");
+    if ((input->requiresGrad || weight->requiresGrad) &&
+        (!tensorOnCpuForTraining(input) || !tensorOnCpuForTraining(weight))) {
+        vmRaiseExceptionMessage("RuntimeError", "conv2d() training currently supports only CPU tensors.");
+        return NIL_VAL;
+    }
+    if (bias != NULL && bias->requiresGrad && !tensorOnCpuForTraining(bias)) {
+        vmRaiseExceptionMessage("RuntimeError", "conv2d() training currently supports only CPU tensors.");
+        return NIL_VAL;
+    }
+    if (bias != NULL && !tensorBiasAsVector(bias, weight->shape[0], &biasData)) {
+        vmRaiseExceptionMessage("ValueError", "conv2d() bias must have shape [O], [1,O], or [1,O,1,1].");
         return NIL_VAL;
     }
 
@@ -2876,6 +3170,62 @@ static Value tensorConv2d(Value inputValue, Value weightValue) {
     outShape[1] = outChannels;
     outShape[2] = outHeight;
     outShape[3] = outWidth;
+    inputChannelStride = inHeight * inWidth;
+    inputBatchStride = inChannels * inputChannelStride;
+    outputChannelStride = outHeight * outWidth;
+    outputBatchStride = outChannels * outputChannelStride;
+    weightChannelStride = kernelHeight * kernelWidth;
+    weightOutStride = inChannels * weightChannelStride;
+
+    canUseMetalKernel = !input->requiresGrad &&
+                        !weight->requiresGrad &&
+                        (bias == NULL || !bias->requiresGrad) &&
+                        input->device->kind == TP_DEVICE_METAL &&
+                        weight->device->kind == TP_DEVICE_METAL &&
+                        input->metalBuffer != NULL &&
+                        weight->metalBuffer != NULL &&
+                        (bias == NULL || (bias->device->kind == TP_DEVICE_METAL && bias->metalBuffer != NULL));
+
+    if (canUseMetalKernel) {
+        out = createTensorFromShape(4, outShape, vm.metalDevice);
+        if (out == NULL) {
+            vmRaiseExceptionMessage("RuntimeError", "Out of memory while creating tensor.");
+            return NIL_VAL;
+        }
+        if (tpMetalConv2dF32(vm.metalBackend,
+                             input->metalBuffer,
+                             weight->metalBuffer,
+                             bias != NULL ? bias->metalBuffer : NULL,
+                             out->metalBuffer,
+                             batch,
+                             inChannels,
+                             inHeight,
+                             inWidth,
+                             outChannels,
+                             outHeight,
+                             outWidth,
+                             kernelHeight,
+                             kernelWidth,
+                             applyRelu ? 1 : 0)) {
+            out->cpuDirty = true;
+            out->metalDirty = false;
+            if (!setAutogradBinary(out, input, weight, TP_AUTOGRAD_CONV2D)) {
+                return NIL_VAL;
+            }
+            return OBJ_VAL(out);
+        }
+    }
+
+    if (!input->requiresGrad && !weight->requiresGrad) {
+        if (!syncTensorFromMetal(input) || !syncTensorFromMetal(weight)) {
+            vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+            return NIL_VAL;
+        }
+        if (bias != NULL && !syncTensorFromMetal(bias)) {
+            vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+            return NIL_VAL;
+        }
+    }
 
     out = createTensorFromShape(4, outShape, vm.cpuDevice);
     if (out == NULL) {
@@ -2883,24 +3233,79 @@ static Value tensorConv2d(Value inputValue, Value weightValue) {
         return NIL_VAL;
     }
 
-    for (n = 0; n < batch; n++) {
-        for (oc = 0; oc < outChannels; oc++) {
-            for (oy = 0; oy < outHeight; oy++) {
-                for (ox = 0; ox < outWidth; ox++) {
-                    float total = 0.0f;
-                    for (ic = 0; ic < inChannels; ic++) {
-                        for (ky = 0; ky < kernelHeight; ky++) {
-                            for (kx = 0; kx < kernelWidth; kx++) {
-                                int inIndex = ((n * inChannels + ic) * inHeight + (oy + ky)) * inWidth + (ox + kx);
-                                int weightIndex = ((oc * inChannels + ic) * kernelHeight + ky) * kernelWidth + kx;
-                                total += input->data[inIndex] * weight->data[weightIndex];
-                            }
-                        }
-                    }
-                    out->data[((n * outChannels + oc) * outHeight + oy) * outWidth + ox] = total;
+    task.input = input;
+    task.weight = weight;
+    task.out = out;
+    task.inChannels = inChannels;
+    task.inHeight = inHeight;
+    task.inWidth = inWidth;
+    task.outChannels = outChannels;
+    task.outHeight = outHeight;
+    task.outWidth = outWidth;
+    task.kernelHeight = kernelHeight;
+    task.kernelWidth = kernelWidth;
+    task.inputBatchStride = inputBatchStride;
+    task.inputChannelStride = inputChannelStride;
+    task.outputBatchStride = outputBatchStride;
+    task.outputChannelStride = outputChannelStride;
+    task.weightOutStride = weightOutStride;
+    task.weightChannelStride = weightChannelStride;
+
+    if (!input->requiresGrad &&
+        !weight->requiresGrad &&
+        (usedAccelerateInference = tensorConv2dAccelerateInference(input,
+                                                                   weight,
+                                                                   bias,
+                                                                   out,
+                                                                   inChannels,
+                                                                   inHeight,
+                                                                   inWidth,
+                                                                   outChannels,
+                                                                   outHeight,
+                                                                   outWidth,
+                                                                   kernelHeight,
+                                                                   kernelWidth,
+                                                                   applyRelu))) {
+        /* accelerate path already wrote output */
+    } else if (batch * outChannels * outHeight * outWidth >= vm.compute.parallelThreshold &&
+               vm.compute.pool != NULL &&
+               vm.compute.threadCount > 1) {
+        int total = batch * outChannels * outHeight * outWidth;
+        int grain = total / (vm.compute.threadCount * 4);
+        if (grain < outWidth) {
+            grain = outWidth;
+        }
+        if (!platformThreadPoolParallelFor(vm.compute.pool, 0, total, grain, tensorConv2dRangeTask, &task)) {
+            vmRaiseExceptionMessage("RuntimeError", "conv2d() parallel execution failed.");
+            return NIL_VAL;
+        }
+    } else {
+        tensorConv2dRangeTask(0, batch * outChannels * outHeight * outWidth, &task);
+    }
+
+    if (!usedAccelerateInference && (biasData != NULL || applyRelu)) {
+        int n;
+        int oc;
+        int spatial;
+        for (n = 0; n < batch; n++) {
+            float* outBatch = out->data + n * outputBatchStride;
+            for (oc = 0; oc < outChannels; oc++) {
+                float biasValueF32 = biasData != NULL ? biasData[oc] : 0.0f;
+                float* outChannel = outBatch + oc * outputChannelStride;
+                for (spatial = 0; spatial < outputChannelStride; spatial++) {
+                    float value = outChannel[spatial] + biasValueF32;
+                    outChannel[spatial] = applyRelu && value < 0.0f ? 0.0f : value;
                 }
             }
         }
+    }
+
+    if ((input->device->kind == TP_DEVICE_METAL ||
+         weight->device->kind == TP_DEVICE_METAL ||
+         (bias != NULL && bias->device->kind == TP_DEVICE_METAL)) &&
+        !syncTensorToMetal(out)) {
+        vmRaiseExceptionMessage("RuntimeError", "Failed to synchronize Metal tensor.");
+        return NIL_VAL;
     }
 
     if (!setAutogradBinary(out, input, weight, TP_AUTOGRAD_CONV2D)) {
@@ -3057,6 +3462,539 @@ static Value mlAdamStepNative(int argCount, Value* args) {
     return NIL_VAL;
 }
 
+static void tensorConv2dRangeTask(int start, int end, void* context) {
+    TPConv2dTask* task = (TPConv2dTask*)context;
+    int index;
+
+    for (index = start; index < end; index++) {
+        int n = index / task->outputBatchStride;
+        int batchOffset = index % task->outputBatchStride;
+        int oc = batchOffset / task->outputChannelStride;
+        int channelOffset = batchOffset % task->outputChannelStride;
+        int oy = channelOffset / task->outWidth;
+        int ox = channelOffset % task->outWidth;
+        float total = 0.0f;
+        int ic;
+        int ky;
+        int kx;
+        const float* inputBatch = task->input->data + n * task->inputBatchStride;
+        const float* weightOut = task->weight->data + oc * task->weightOutStride;
+
+        for (ic = 0; ic < task->inChannels; ic++) {
+            const float* inputChannel = inputBatch + ic * task->inputChannelStride;
+            const float* weightChannel = weightOut + ic * task->weightChannelStride;
+            for (ky = 0; ky < task->kernelHeight; ky++) {
+                const float* inputRow = inputChannel + (oy + ky) * task->inWidth + ox;
+                const float* weightRow = weightChannel + ky * task->kernelWidth;
+                for (kx = 0; kx < task->kernelWidth; kx++) {
+                    total += inputRow[kx] * weightRow[kx];
+                }
+            }
+        }
+
+        task->out->data[index] = total;
+    }
+}
+
+static bool tensorConv2dAccelerateInference(const ObjTensor* input,
+                                            const ObjTensor* weight,
+                                            const ObjTensor* bias,
+                                            ObjTensor* out,
+                                            int inChannels,
+                                            int inHeight,
+                                            int inWidth,
+                                            int outChannels,
+                                            int outHeight,
+                                            int outWidth,
+                                            int kernelHeight,
+                                            int kernelWidth,
+                                            bool applyRelu) {
+#if TP_HAS_ACCELERATE
+    int batch = input->shape[0];
+    int kernelSpan = inChannels * kernelHeight * kernelWidth;
+    int outSpatial = outHeight * outWidth;
+    int chunkSize = 128;
+    int chunkSpatial;
+    float* cols;
+    float* chunkOut;
+    const float* biasData = NULL;
+    int chunkStart;
+    int ic;
+    int ky;
+    int kx;
+    int oy;
+    int ox;
+
+    if (bias != NULL && !tensorBiasAsVector(bias, outChannels, &biasData)) {
+        return false;
+    }
+    if (chunkSize > batch) {
+        chunkSize = batch;
+    }
+    if (chunkSize <= 0) {
+        return true;
+    }
+    chunkSpatial = chunkSize * outSpatial;
+    cols = (float*)malloc(sizeof(float) * (size_t)kernelSpan * (size_t)chunkSpatial);
+    chunkOut = (float*)malloc(sizeof(float) * (size_t)outChannels * (size_t)chunkSpatial);
+    if (cols == NULL || chunkOut == NULL) {
+        free(cols);
+        free(chunkOut);
+        return false;
+    }
+
+    for (chunkStart = 0; chunkStart < batch; chunkStart += chunkSize) {
+        int actualChunk = batch - chunkStart;
+        int n;
+        int oc;
+        if (actualChunk > chunkSize) {
+            actualChunk = chunkSize;
+        }
+
+        for (n = 0; n < actualChunk; n++) {
+            const float* inputBatch = input->data + (size_t)(chunkStart + n) * (size_t)inChannels * (size_t)inHeight * (size_t)inWidth;
+            int kernelIndex = 0;
+            for (ic = 0; ic < inChannels; ic++) {
+                const float* inputChannel = inputBatch + (size_t)ic * (size_t)inHeight * (size_t)inWidth;
+                for (ky = 0; ky < kernelHeight; ky++) {
+                    for (kx = 0; kx < kernelWidth; kx++) {
+                        float* colRow = cols + (size_t)kernelIndex * (size_t)(chunkSize * outSpatial) + (size_t)n * (size_t)outSpatial;
+                        int outIndex = 0;
+                        for (oy = 0; oy < outHeight; oy++) {
+                            const float* inputRow = inputChannel + (size_t)(oy + ky) * (size_t)inWidth + kx;
+                            for (ox = 0; ox < outWidth; ox++) {
+                                colRow[outIndex++] = inputRow[ox];
+                            }
+                        }
+                        kernelIndex++;
+                    }
+                }
+            }
+        }
+
+        cblas_sgemm(CblasRowMajor,
+                    CblasNoTrans,
+                    CblasNoTrans,
+                    outChannels,
+                    actualChunk * outSpatial,
+                    kernelSpan,
+                    1.0f,
+                    weight->data,
+                    kernelSpan,
+                    cols,
+                    chunkSize * outSpatial,
+                    0.0f,
+                    chunkOut,
+                    chunkSize * outSpatial);
+
+        for (n = 0; n < actualChunk; n++) {
+            float* outBatch = out->data + (size_t)(chunkStart + n) * (size_t)outChannels * (size_t)outSpatial;
+            for (oc = 0; oc < outChannels; oc++) {
+                float* outChannel = outBatch + (size_t)oc * (size_t)outSpatial;
+                const float* src = chunkOut + (size_t)oc * (size_t)(chunkSize * outSpatial) + (size_t)n * (size_t)outSpatial;
+                if (biasData != NULL) {
+                    float biasValueF32 = biasData[oc];
+                    int idx;
+                    for (idx = 0; idx < outSpatial; idx++) {
+                        float value = src[idx] + biasValueF32;
+                        outChannel[idx] = applyRelu && value < 0.0f ? 0.0f : value;
+                    }
+                } else {
+                    if (applyRelu) {
+                        int idx;
+                        for (idx = 0; idx < outSpatial; idx++) {
+                            float value = src[idx];
+                            outChannel[idx] = value < 0.0f ? 0.0f : value;
+                        }
+                    } else {
+                        memcpy(outChannel, src, sizeof(float) * (size_t)outSpatial);
+                    }
+                }
+            }
+        }
+    }
+
+    free(cols);
+    free(chunkOut);
+    return true;
+#else
+    (void)input;
+    (void)weight;
+    (void)bias;
+    (void)out;
+    (void)inChannels;
+    (void)inHeight;
+    (void)inWidth;
+    (void)outChannels;
+    (void)outHeight;
+    (void)outWidth;
+    (void)kernelHeight;
+    (void)kernelWidth;
+    (void)applyRelu;
+    return false;
+#endif
+}
+
+static void skipLineEndingChars(const char** cursor) {
+    while (**cursor == '\r' || **cursor == '\n') {
+        (*cursor)++;
+    }
+}
+
+static bool parseCsvIntegerField(const char** cursor, long* outValue) {
+    char* end;
+
+    while (**cursor == ' ' || **cursor == '\t') {
+        (*cursor)++;
+    }
+
+    if (**cursor == '\0' || **cursor == '\r' || **cursor == '\n') {
+        return false;
+    }
+
+    *outValue = strtol(*cursor, &end, 10);
+    if (end == *cursor) {
+        return false;
+    }
+
+    while (*end == ' ' || *end == '\t') {
+        end++;
+    }
+
+    *cursor = end;
+    return true;
+}
+
+static Value mlLoadMnistCsvNative(int argCount, Value* args) {
+    const char* cursor;
+    char* text;
+    int limit = -1;
+    ObjList* images;
+    ObjList* labels;
+    ObjList* result;
+
+    if (argCount < 1 || argCount > 2 || !IS_STRING(args[0])) {
+        vmRaiseExceptionMessage("TypeError", "load_mnist_csv() expects a path and an optional limit.");
+        return NIL_VAL;
+    }
+    if (argCount == 2) {
+        if (IS_NIL(args[1])) {
+            limit = -1;
+        } else if (IS_NUMBER(args[1])) {
+            limit = (int)AS_NUMBER(args[1]);
+        } else {
+            vmRaiseExceptionMessage("TypeError", "load_mnist_csv() limit must be a number or None.");
+            return NIL_VAL;
+        }
+    }
+
+    text = platformReadTextFile(AS_CSTRING(args[0]));
+    if (text == NULL) {
+        vmRaiseExceptionMessage("RuntimeError", "Could not read MNIST CSV file.");
+        return NIL_VAL;
+    }
+
+    images = newList();
+    labels = newList();
+    cursor = text;
+
+    while (*cursor != '\0') {
+        ObjList* image;
+        ObjList* channel;
+        long label;
+        int pixelIndex;
+
+        skipLineEndingChars(&cursor);
+        if (*cursor == '\0') {
+            break;
+        }
+        if (limit >= 0 && images->items.count >= limit) {
+            break;
+        }
+
+        if (!parseCsvIntegerField(&cursor, &label)) {
+            free(text);
+            vmRaiseExceptionMessage("ValueError", "Invalid MNIST CSV label.");
+            return NIL_VAL;
+        }
+        if (*cursor != ',') {
+            free(text);
+            vmRaiseExceptionMessage("ValueError", "Invalid MNIST CSV row format.");
+            return NIL_VAL;
+        }
+        cursor++;
+
+        image = newList();
+        channel = newList();
+
+        for (pixelIndex = 0; pixelIndex < 28 * 28; pixelIndex++) {
+            ObjList* row;
+            long pixel;
+
+            if (pixelIndex % 28 == 0) {
+                row = newList();
+                writeValueArray(&image->items, OBJ_VAL(row));
+            } else {
+                row = AS_LIST(image->items.values[image->items.count - 1]);
+            }
+
+            if (!parseCsvIntegerField(&cursor, &pixel)) {
+                free(text);
+                vmRaiseExceptionMessage("ValueError", "Invalid MNIST CSV pixel.");
+                return NIL_VAL;
+            }
+            writeValueArray(&row->items, NUMBER_VAL((double)pixel / 255.0));
+
+            if (pixelIndex < 28 * 28 - 1) {
+                if (*cursor != ',') {
+                    free(text);
+                    vmRaiseExceptionMessage("ValueError", "Invalid MNIST CSV pixel separator.");
+                    return NIL_VAL;
+                }
+                cursor++;
+            }
+        }
+
+        if (*cursor == '\r') {
+            cursor++;
+        }
+        if (*cursor == '\n') {
+            cursor++;
+        } else if (*cursor != '\0') {
+            free(text);
+            vmRaiseExceptionMessage("ValueError", "Invalid MNIST CSV line ending.");
+            return NIL_VAL;
+        }
+
+        writeValueArray(&channel->items, OBJ_VAL(image));
+        writeValueArray(&images->items, OBJ_VAL(channel));
+        writeValueArray(&labels->items, NUMBER_VAL((double)label));
+    }
+
+    free(text);
+
+    result = newList();
+    writeValueArray(&result->items, OBJ_VAL(images));
+    writeValueArray(&result->items, OBJ_VAL(labels));
+    return OBJ_VAL(result);
+}
+
+static bool csvAppendField(ObjList* row, const char* chars, int length) {
+    writeValueArray(&row->items, OBJ_VAL(copyString(chars, length)));
+    return true;
+}
+
+static bool csvGrowBuffer(char** buffer, int* capacity, int needed) {
+    char* grown;
+    int nextCapacity = *capacity;
+
+    while (nextCapacity < needed) {
+        nextCapacity *= 2;
+    }
+
+    grown = (char*)realloc(*buffer, (size_t)nextCapacity);
+    if (grown == NULL) {
+        return false;
+    }
+
+    *buffer = grown;
+    *capacity = nextCapacity;
+    return true;
+}
+
+static bool csvParseDelimiterArg(int argCount, Value* args, int index, char* outDelimiter) {
+    if (argCount <= index) {
+        *outDelimiter = ',';
+        return true;
+    }
+    if (!IS_STRING(args[index]) || AS_STRING(args[index])->length != 1) {
+        vmRaiseExceptionMessage("TypeError", "csv delimiter must be a single-character string.");
+        return false;
+    }
+    *outDelimiter = AS_STRING(args[index])->chars[0];
+    return true;
+}
+
+static Value csvParseText(const char* text, char delimiter) {
+    ObjList* rows = newList();
+    ObjList* row = newList();
+    int fieldCapacity = 64;
+    char* field = (char*)malloc((size_t)fieldCapacity);
+    int fieldLength = 0;
+    bool inQuotes = false;
+    bool rowHasData = false;
+    int i;
+
+    if (field == NULL) {
+        vmRaiseExceptionMessage("RuntimeError", "Out of memory while parsing CSV.");
+        return NIL_VAL;
+    }
+
+    for (i = 0;; i++) {
+        char ch = text[i];
+
+        if (inQuotes) {
+            if (ch == '"') {
+                if (text[i + 1] == '"') {
+                    if (fieldLength + 1 >= fieldCapacity &&
+                        !csvGrowBuffer(&field, &fieldCapacity, fieldLength + 2)) {
+                        free(field);
+                        vmRaiseExceptionMessage("RuntimeError", "Out of memory while parsing CSV.");
+                        return NIL_VAL;
+                    }
+                    field[fieldLength++] = '"';
+                    i++;
+                    continue;
+                }
+                inQuotes = false;
+                continue;
+            }
+
+            if (ch == '\0') {
+                free(field);
+                vmRaiseExceptionMessage("ValueError", "Unterminated quoted field");
+                return NIL_VAL;
+            }
+
+            if (fieldLength + 1 >= fieldCapacity &&
+                !csvGrowBuffer(&field, &fieldCapacity, fieldLength + 2)) {
+                free(field);
+                vmRaiseExceptionMessage("RuntimeError", "Out of memory while parsing CSV.");
+                return NIL_VAL;
+            }
+            field[fieldLength++] = ch;
+            continue;
+        }
+
+        if (ch == '"') {
+            inQuotes = true;
+            rowHasData = true;
+            continue;
+        }
+
+        if (ch == delimiter || ch == '\n' || ch == '\0') {
+            if (ch == '\0' && fieldLength == 0 && !rowHasData) {
+                break;
+            }
+            if (!csvAppendField(row, field, fieldLength)) {
+                free(field);
+                vmRaiseExceptionMessage("RuntimeError", "Out of memory while parsing CSV.");
+                return NIL_VAL;
+            }
+            fieldLength = 0;
+            rowHasData = true;
+
+            if (ch == '\n' || ch == '\0') {
+                if (rowHasData) {
+                    writeValueArray(&rows->items, OBJ_VAL(row));
+                }
+                if (ch == '\0') {
+                    break;
+                }
+                row = newList();
+                rowHasData = false;
+            }
+            continue;
+        }
+
+        if (ch == '\r') {
+            continue;
+        }
+
+        if (fieldLength + 1 >= fieldCapacity &&
+            !csvGrowBuffer(&field, &fieldCapacity, fieldLength + 2)) {
+            free(field);
+            vmRaiseExceptionMessage("RuntimeError", "Out of memory while parsing CSV.");
+            return NIL_VAL;
+        }
+        field[fieldLength++] = ch;
+        rowHasData = true;
+    }
+
+    free(field);
+    return OBJ_VAL(rows);
+}
+
+static Value csvLoadsNative(int argCount, Value* args) {
+    char delimiter;
+
+    if (argCount < 1 || argCount > 2 || !IS_STRING(args[0])) {
+        vmRaiseExceptionMessage("TypeError", "csv.loads() expects text and an optional delimiter.");
+        return NIL_VAL;
+    }
+    if (!csvParseDelimiterArg(argCount, args, 1, &delimiter)) {
+        return NIL_VAL;
+    }
+
+    return csvParseText(AS_STRING(args[0])->chars, delimiter);
+}
+
+static Value csvReadRowsNative(int argCount, Value* args) {
+    char delimiter;
+    char* text;
+    Value rows;
+
+    if (argCount < 1 || argCount > 2 || !IS_STRING(args[0])) {
+        vmRaiseExceptionMessage("TypeError", "csv.read_rows() expects a path and an optional delimiter.");
+        return NIL_VAL;
+    }
+    if (!csvParseDelimiterArg(argCount, args, 1, &delimiter)) {
+        return NIL_VAL;
+    }
+
+    text = platformReadTextFile(AS_STRING(args[0])->chars);
+    if (text == NULL) {
+        vmRaiseExceptionMessage("RuntimeError", "Could not read CSV file.");
+        return NIL_VAL;
+    }
+
+    rows = csvParseText(text, delimiter);
+    free(text);
+    return rows;
+}
+
+static Value csvReadDictsNative(int argCount, Value* args) {
+    Value rowsValue;
+    ObjList* rows;
+    ObjList* header;
+    ObjList* out;
+    int i;
+
+    rowsValue = csvReadRowsNative(argCount, args);
+    if (!IS_LIST(rowsValue)) {
+        return rowsValue;
+    }
+
+    rows = AS_LIST(rowsValue);
+    if (rows->items.count == 0 || !IS_LIST(rows->items.values[0])) {
+        return OBJ_VAL(newList());
+    }
+
+    header = AS_LIST(rows->items.values[0]);
+    out = newList();
+
+    for (i = 1; i < rows->items.count; i++) {
+        ObjDict* item;
+        ObjList* rowItems;
+        int j;
+
+        if (!IS_LIST(rows->items.values[i])) {
+            continue;
+        }
+
+        rowItems = AS_LIST(rows->items.values[i]);
+        item = newDict();
+        for (j = 0; j < header->items.count; j++) {
+            Value key = header->items.values[j];
+            Value value = j < rowItems->items.count ? rowItems->items.values[j] : OBJ_VAL(copyString("", 0));
+            tableSet(&item->table, key, value);
+        }
+        writeValueArray(&out->items, OBJ_VAL(item));
+    }
+
+    return OBJ_VAL(out);
+}
+
 static void defineNative(const char* name, NativeFn function) {
     Value key = OBJ_VAL(copyString(name, (int)strlen(name)));
     Value native = OBJ_VAL(newNative(function));
@@ -3085,6 +4023,7 @@ static void defineBuiltinMlModule(void) {
     defineModuleNative(module, "device", mlDeviceNative);
     defineModuleNative(module, "dtype", mlDTypeNative);
     defineModuleNative(module, "metal_available", mlMetalAvailableNative);
+    defineModuleNative(module, "metal_error", mlMetalErrorNative);
     defineModuleNative(module, "tensor", mlTensorNative);
     defineModuleNative(module, "Parameter", mlParameterNative);
     defineModuleNative(module, "zeros", mlZerosNative);
@@ -3114,6 +4053,20 @@ static void defineBuiltinMlModule(void) {
     defineModuleNative(module, "zero_grad", mlZeroGradNative);
     defineModuleNative(module, "sgd_step", mlSgdStepNative);
     defineModuleNative(module, "adam_step", mlAdamStepNative);
+    defineModuleNative(module, "load_mnist_csv", mlLoadMnistCsvNative);
+
+    tableSet(&vm.modules, OBJ_VAL(moduleName), OBJ_VAL(module));
+    tableSet(vm.globalEnv->table, OBJ_VAL(moduleName), OBJ_VAL(module));
+}
+
+static void defineBuiltinCsvModule(void) {
+    ObjString* moduleName = copyString("csv", 3);
+    ObjInstance* module = newInstance(vm.moduleClass);
+
+    tableSet(&module->fields, OBJ_VAL(copyString("__name__", 8)), OBJ_VAL(moduleName));
+    defineModuleNative(module, "loads", csvLoadsNative);
+    defineModuleNative(module, "read_rows", csvReadRowsNative);
+    defineModuleNative(module, "read_dicts", csvReadDictsNative);
 
     tableSet(&vm.modules, OBJ_VAL(moduleName), OBJ_VAL(module));
     tableSet(vm.globalEnv->table, OBJ_VAL(moduleName), OBJ_VAL(module));
@@ -3211,8 +4164,10 @@ void registerBuiltins() {
     defineNative("__ml_zero_grad_tensor", mlZeroGradTensorNative);
     defineNative("__ml_sgd_step", mlSgdStepNative);
     defineNative("__ml_adam_step", mlAdamStepNative);
+    defineNative("__ml_load_mnist_csv", mlLoadMnistCsvNative);
     defineValue("__ml_cpu", OBJ_VAL(vm.cpuDevice));
     defineValue("__ml_metal", OBJ_VAL(vm.metalDevice));
     defineValue("__ml_float32", OBJ_VAL(vm.float32DType));
     defineBuiltinMlModule();
+    defineBuiltinCsvModule();
 }

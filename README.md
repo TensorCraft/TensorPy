@@ -1,273 +1,194 @@
 # TensorPy
 
-TensorPy is an AI Native Python interpreter written in C. It is built around a practical Python-like language core plus native support for tensors, devices, autograd, atomics, SIMD compute paths, threading primitives, and explicit Metal acceleration on Apple Silicon.
+TensorPy is an AI-native Python interpreter written in C.
 
-This project is still in an active build-out phase. The goal is not full CPython compatibility. The goal is a compact, hackable, high-performance interpreter that feels Pythonic while treating ML and systems primitives as first-class runtime features instead of bolted-on libraries.
+It is not a thin scripting layer over an external ML stack. The runtime owns the language core, object model, garbage collector, tensor system, autograd path, portability layer, concurrency primitives, and embedding surface directly.
 
-## Positioning
+The project goal is not full CPython compatibility. The goal is a compact, hackable, systems-oriented runtime where AI workloads are first-class runtime behavior instead of an add-on library.
 
-TensorPy aims to be:
+## Why TensorPy Exists
 
-- an AI Native Python interpreter, not just a Python-like scripting language
-- native-first for `tensor`, `device`, and training workflows
-- systems-aware, with built-in concurrency primitives, atomics, SIMD, and portability layers
-- small enough to understand, modify, and extend without a giant runtime stack
+Most modern AI applications are assembled from multiple layers:
 
-## Current Features
+- Python
+- package imports
+- data loading glue
+- NumPy / pandas preprocessing
+- framework runtime
+- backend dispatch
 
-- Python-like syntax for expressions, functions, classes, conditionals, loops, slicing, and container literals
-- Core data structures: `list`, `tuple`, `dict`, `set`, `str`, `bytes`
-- Typed exceptions with `try` / `except`, including `except Exception as e`
-- Improved function call semantics for keyword arguments, duplicate parameter checks, missing-argument reporting, and `*args`
-- Basic nested-function closure capture for outer bindings
-- REPL plus file execution
-- Basic module imports:
-  - `import module`
-  - `import package.module`
-  - `from module import name`
-  - `from package import module`
-  - `from package.module import name`
-  - `from module import name as alias`
-- Module lookup currently checks:
-  - `modules/<name>.py`
-  - `modules/<pkg>/__init__.py`
-  - `lib/<name>.py`
-  - `./<name>.py`
-- Builtin-like modules written in TensorPy:
-  - `json`
-  - `re`
-  - `math`
-  - `time`
-  - `random`
-  - `os`
-  - `io`
-  - `path`
-  - `logging`
-  - `traceback`
-  - `sys`
-  - `collections`
-  - `itertools`
-  - `functools`
-  - `env`
-  - `config`
-  - `host`
-  - `array`
-  - `ml` (builtin module)
-  - `types`
-  - `inspect`
-- Platform-facing runtime operations are routed through a portability layer in `src/platform.c`
-- Native ML runtime with `tensor`, `dtype`, `device`, autograd primitives, and eager ops
-- Runtime concurrency layer with threads, mutexes, condition variables, atomics, thread pool, and `parallel_for`
-- CPU compute backend with scalar, SIMD, and threaded execution paths for core float32 kernels
-- Apple Silicon Metal backend with explicit opt-in execution and a portable no-Metal build mode
-- CPU remains the default execution device for compatibility; Metal is explicit opt-in
+That stack is powerful, but it also carries real startup cost, integration cost, and control loss.
 
-## Milestone Status
+TensorPy explores a different design:
 
-See [ROADMAP.md](/Users/tensorcraft/Projects/TensorPy/ROADMAP.md) for the tracked checklist of completed work, in-flight work, and next priorities.
+- one runtime
+- one object model
+- one execution environment
+- one integrated path from script to tensor to training or inference
 
-## Implemented Library Surface
+That makes it a better fit for:
 
-The runtime already includes a practical set of methods for:
+- small-model and short-run AI workloads
+- embedded or OS-level integration
+- interactive batch-1 pipelines
+- host applications that want a compact embeddable AI runtime
+- systems work where language, runtime, and ML behavior need to be tuned together
 
-- `list`
-- `dict`
-- `set`
-- `tuple`
-- `str`
-- `bytes`
+## Project Thesis
 
-Examples include methods such as `append`, `pop`, `remove`, `sort`, `setdefault`, `popitem`, `union`, `intersection`, `count`, `index`, `split`, `join`, `encode`, `decode`, and `hex`.
+TensorPy is built around three ideas:
 
-Common builtins now also include:
+1. AI should be a runtime feature, not an external dependency chain.
+2. A smaller and more integrated stack can beat larger frameworks on end-to-end latency, not just on code size.
+3. Rebuilding the stack from the interpreter upward is a practical way to understand and control execution, memory, scheduling, and device behavior.
 
-- `isinstance`
-- `getattr`
-- `setattr`
-- `hasattr`
-- `reversed`
-- `zip`
-- `map`
-- `filter`
-- `round`
-- `ord`
-- `chr`
-- `dir`
+## What It Already Includes
 
-Functions, lambdas, and methods now support `*args` collection.
+### Language Core
 
-The `json` module supports:
+- Python-like expressions, statements, loops, slicing, and container literals
+- Functions, lambdas, closures, and `*args`
+- Classes, inheritance, and `super()`
+- Exceptions with `try` / `except`
+- REPL and script execution
+- Module imports, package imports, and module caching
 
-- `json.loads(...)`
-- `json.dumps(...)`
-- `json.JSON(...).parse()`
-- string escapes including `\n`, `\t`, `\r`, `\b`, `\f`, and `\uXXXX`
-- exponent numbers like `1.5e2`
-- stricter invalid-literal and invalid-escape errors
+### Runtime
 
-The `os` module currently supports:
+- Bytecode compiler and VM
+- Mark-and-sweep garbage collector
+- Platform abstraction layer for filesystem, time, random, threads, and process-facing operations
+- Shared memory abstraction and ongoing cleanup of allocator routing
+- Public scalar embedding API via [`include/tensorpy/api.h`](/Users/tensorcraft/Projects/TensorPy/include/tensorpy/api.h)
 
-- `os.name`
-- `os.sep`
-- `os.getcwd()`
-- `os.listdir(path=".")`
-- `os.exists(path)`
-- `os.isdir(path)`
-- `os.isfile(path)`
-- `os.mkdir(path, exist_ok=False)`
-- `os.makedirs(path, exist_ok=False)`
-- `os.remove(path)`
-- `os.rmdir(path)`
-- `os.rename(src, dst)`
-- `os.replace(src, dst)`
-- `os.removedirs(path)`
-- `os.getenv(name, default=None)`
-- `os.system(command)`
+### Systems Primitives
 
-The V1 utility modules also include:
+- Threads
+- Mutexes
+- Condition variables
+- Atomics
+- Thread pool
+- `parallel_for`
 
-- `io.read_text(path)` / `io.write_text(path, text)`
-- `io.read_bytes(path)` / `io.write_bytes(path, bytes)`
-- `io.append_text(path, text)` / `io.append_bytes(path, bytes)`
-- `io.read_lines(path)` / `io.write_lines(path, lines)`
-- `path.join(...)`, `path.normpath(...)`, `path.abspath(...)`
-- `path.basename(...)`, `path.dirname(...)`, `path.splitext(...)`
-- `path.exists(...)`, `path.isdir(...)`, `path.isfile(...)`
-- `path.split(...)`, `path.relpath(path, start=".")`
-- `logging.debug/info/warn/error(...)`
-- `logging.basicConfig(level=...)`, `logging.exception(exc)`
-- `logging.getLogger(name)`
-- `traceback.format_exception(exc)` / `traceback.print_exception(exc)`
-- `traceback.format_exception_only(exc)` / `traceback.as_dict(exc)`
-- minimal `sys` metadata: `implementation`, `version`, `version_info`, `platform`, `argv`, `path`, `byteorder`, `executable`
-- `collections.Counter`, `collections.defaultdict`, `collections.flatten`, `collections.chunked`
-- `itertools.chain`, `itertools.repeat`, `itertools.take`, `itertools.batched`
-- `functools.partial`, `functools.compose`
-- `env.get`, `env.exists`, `env.require`
-- `config.load`, `config.loads`, `config.get`, `config.require`, `config.merge`
-- `host.set`, `host.get`, `host.has`, `host.call`
-- `array.zeros`, `array.full`, `array.shape`, `array.add`, `array.mul`, `array.matmul`
-- `ml.metal_available()`
-- `ml.device(name)`, `ml.dtype(name)`
-- `ml.tensor(data, dtype=None, device=None)`
-- `ml.Parameter(data, dtype=None, device=None)`
-- `ml.zeros(shape, dtype=None, device=None)`
-- `ml.ones(shape, dtype=None, device=None)`
-- `ml.full(shape, value, dtype=None, device=None)`
-- `ml.arange(start, stop=None, step=None)`
-- `ml.reshape(tensor, shape)`, `ml.cast(tensor, dtype)`
-- `ml.add/sub/mul/div`, `ml.sum/mean/max`, `ml.matmul`
-- `ml.relu`, `ml.sigmoid`, `ml.gelu`, `ml.softmax`, `ml.layernorm`
-- `ml.mse_loss(pred, target)`
-- `ml.backward(tensor)`, `ml.zero_grad(params)`, `ml.sgd_step(params, lr)`
-- `types.type_name` plus basic `is_*` helpers
-- `inspect.type_name`, `inspect.is_callable`, `inspect.is_function`, `inspect.is_class`, `inspect.is_module`
+### Tensor / ML Runtime
 
-Tensor objects currently expose:
+- Native `tensor`, `device`, and `dtype` objects
+- CPU eager ops for float32 tensors
+- Autograd subset for practical training loops
+- CPU scalar, SIMD, and threaded execution paths
+- Apple Silicon Metal backend with explicit opt-in execution
+- Native data ingress helper for MNIST CSV via `ml.load_mnist_csv(...)`
 
-- `.shape`, `.rank`, `.size`, `.dtype`, `.device`, `.contiguous`, `.strides`
-- `.requires_grad`, `.grad`
-- `.reshape(...)`, `.to(...)`, `.astype(...)`
-- `.item()`, `.backward()`, `.zero_grad()`
-- `.sum()`, `.mean()`, `.max()`, `.matmul(...)`
-- `.relu()`, `.sigmoid()`, `.gelu()`, `.softmax()`, `.layernorm()`
+### NN Stack
 
-The `re` module currently supports a useful regex subset:
+- `Module`
+- `Linear`
+- `Conv2d`
+- `ReLU`
+- `Sigmoid`
+- `Tanh`
+- `Flatten`
+- `Sequential`
+- `Embedding`
+- `RNN`, `LSTM`, `GRU`
+- `LogisticRegression`, `MLP`, `SimpleCNN`
+- `Adam`
 
-- `re.compile(...)`
-- `re.match(...)`
-- `re.search(...)`
-- `re.fullmatch(...)`
-- `re.findall(...)`
-- `re.split(...)`
-- `re.sub(...)`
-- `re.subn(...)`
+### Standard Library Surface
 
-Supported regex constructs currently include:
+TensorPy already ships a practical built-in module set:
 
-- literals
-- `.`
-- `^` and `$`
-- top-level alternation with `|`
-- `*`, `+`, `?`
-- grouping, including grouped quantifiers like `(ab)+`
-- character classes like `[abc]`
-- ranges like `[a-z]`
-- negated classes like `[^0-9]`
-- `\d`, `\w`, `\s`
-- captured-group access via `group(1)`, `start(1)`, `end(1)`, and `span(1)`
+- `json`
+- `re`
+- `math`
+- `time`
+- `random`
+- `os`
+- `io`
+- `path`
+- `logging`
+- `traceback`
+- `sys`
+- `collections`
+- `itertools`
+- `functools`
+- `env`
+- `config`
+- `host`
+- `array`
+- `ml`
+- `types`
+- `inspect`
 
-## C API Status
+For tracked implementation status, see [ROADMAP.md](/Users/tensorcraft/Projects/TensorPy/ROADMAP.md).
 
-TensorPy now includes a minimal public embedding header:
+## What Makes It Different
 
-- `include/tensorpy/api.h`
+TensorPy is not trying to be a smaller PyTorch clone or a general Python reimplementation.
 
-It exposes an opaque `TPContext` plus small helpers for:
+The defining property is integration:
 
-- creating a context
-- interpreting source in that context
-- reading and writing simple globals as public values
-- retrieving the last runtime error as a public value
-- registering a simple host-native module with scalar values and functions
-- checking the public API / extension ABI version
-- destroying the context
+- the interpreter understands tensors directly
+- the runtime exposes ML and systems primitives natively
+- data ingestion, tensor creation, training steps, and inference stay inside one runtime
+- host embedding does not require pulling in a separate Python runtime plus a separate ML framework
 
-Module registration handles are lightweight setup helpers; the VM owns the
-registered module object after creation.
+That is the core product idea: a compact AI runtime, not a toy language.
 
-This is enough to begin embedding TensorPy from C without including `vm.h` or
-other internal runtime headers. The detailed readiness notes live in:
+## Benchmarks
 
-- `docs/C_API_READINESS.md`
+The most important comparison for TensorPy is not peak CUDA throughput. A pure C++ or CUDA stack should win that contest.
 
-## Build
+The more relevant test is whether a smaller integrated runtime can beat a layered Python stack on end-to-end AI work, especially for:
 
-```bash
-make
-```
+- cold starts
+- AI imports
+- batch-1 execution
+- short runs
+- small models
+- embedded-style execution paths
 
-To build without Metal support:
+### Current Full-MNIST Inference Benchmark
 
-```bash
-make METAL=0
-```
+Benchmark harness:
 
-This produces the interpreter binary:
+- [`benchmarks/run_full_mnist_inference.py`](/Users/tensorcraft/Projects/TensorPy/benchmarks/run_full_mnist_inference.py)
+- [`benchmarks/full_mnist_inference_tensorpy.py`](/Users/tensorcraft/Projects/TensorPy/benchmarks/full_mnist_inference_tensorpy.py)
+- [`benchmarks/full_mnist_inference_pytorch.py`](/Users/tensorcraft/Projects/TensorPy/benchmarks/full_mnist_inference_pytorch.py)
+- [`benchmarks/run_benchmark_matrix.py`](/Users/tensorcraft/Projects/TensorPy/benchmarks/run_benchmark_matrix.py)
+- [`benchmarks/mnist_cnn_tensorpy.py`](/Users/tensorcraft/Projects/TensorPy/benchmarks/mnist_cnn_tensorpy.py)
+- [`benchmarks/mnist_cnn_pytorch.py`](/Users/tensorcraft/Projects/TensorPy/benchmarks/mnist_cnn_pytorch.py)
 
-```bash
-./tensorpy
-```
+Configuration:
 
-## Usage
+- simple CNN
+- full MNIST test set (`10,000` samples)
+- inference-only benchmark plus end-to-end runtime breakdown
+- single-threaded PyTorch baseline
+- PyTorch MPS baseline on Apple Silicon
+- 3-run averages
 
-Run a script:
+Current results:
 
-```bash
-./tensorpy path/to/script.py
-```
+| Scenario | TensorPy | PyTorch | Result |
+| --- | ---: | ---: | --- |
+| CPU pure forward | 0.0723s | 0.1834s | TensorPy wins by 2.5x |
+| CPU end-to-end overall | 0.3465s | 1.9726s | TensorPy wins by 5.7x |
+| Metal pure forward | 0.0575s | 0.0862s | TensorPy wins by 1.5x |
+| Metal end-to-end overall | 0.3342s | 1.9206s | TensorPy wins by 5.7x |
 
-Run one command:
+![TensorPy vs PyTorch full MNIST inference benchmark](docs/assets/full_mnist_inference_comparison.png)
 
-```bash
-./tensorpy -c "print(1 + 2)"
-```
+Interpretation:
 
-Start the interactive REPL:
+- In this specific benchmark, TensorPy wins on both pure forward latency and end-to-end runtime.
+- The biggest end-to-end gains still come from integration: native CSV ingress, lower tensorization cost, and a tighter runtime path.
+- This is not a general claim that TensorPy beats PyTorch in all workloads or at all scales.
+- The useful claim is narrower and more systems-oriented: in a compact full-stack inference path, an AI-native runtime can outperform a broader layered stack.
 
-```bash
-./tensorpy
-```
+That is the intended design center.
 
-In the REPL, expression-like input is automatically echoed:
-
-```text
-> 1 + 2
-3
-> x = 7
-> x
-7
-```
+## Example
 
 ### ML Runtime
 
@@ -275,20 +196,16 @@ In the REPL, expression-like input is automatically echoed:
 import ml
 
 x = ml.tensor([[1, 2], [3, 4]])
-print(x.shape)          # [2, 2]
+print(x.shape)
 print(ml.add(x, x).sum())
 
-# CPU is still the default
-print(ml.ones(4).device.name)   # cpu
-
-# Metal is explicit opt-in
 if ml.metal_available():
     y = ml.ones(4, ml.float32, ml.metal)
-    print(y.device.name)        # metal
+    print(y.device.name)
     print(ml.mul(y, 3).sum())
 ```
 
-### CPU Training Loop
+### Training Loop
 
 ```python
 import ml
@@ -309,97 +226,127 @@ for _ in range(200):
 print(w.item(), b.item())
 ```
 
-## Examples
-
-### Importing Modules
+### Integrated Data Ingress
 
 ```python
-import json
-from json import loads as jl
+import ml
 
-print(json.dumps({"ok": True, "nums": [1, 2]}))
-print(jl("[1,2,3]")[2])
+images, labels = ml.load_mnist_csv("data/mnist/mnist_train_200.csv", 32)
+print(len(images), len(labels))
 ```
 
-### Regex
+## Build
 
-```python
-import re
+Build the default runtime:
 
-print(re.findall("\\d+", "a12 b34 c5"))
-print(re.sub("\\d+", "#", "a12 b34 c5"))
+```bash
+make
+```
+
+Build without Metal:
+
+```bash
+make METAL=0
+```
+
+The resulting binary is:
+
+```bash
+./tensorpy
+```
+
+## Usage
+
+Run a script:
+
+```bash
+./tensorpy path/to/script.py
+```
+
+Run one command:
+
+```bash
+./tensorpy -c "print(1 + 2)"
+```
+
+Start the REPL:
+
+```bash
+./tensorpy
 ```
 
 ## Testing
 
-Run the full test suite:
+Run the full regression suite:
 
 ```bash
 python3 run_tests.py
 ```
 
-At the time of writing, the suite contains `29` organized test files and passes in the current workspace.
+Run the benchmark matrix:
+
+```bash
+python3 benchmarks/run_benchmark_matrix.py
+```
+
+## Embedding
+
+TensorPy includes a minimal public C API:
+
+- [`include/tensorpy/api.h`](/Users/tensorcraft/Projects/TensorPy/include/tensorpy/api.h)
+
+Current scope:
+
+- create and destroy a `TPContext`
+- interpret code in that context
+- read and write scalar globals
+- inspect the last runtime error
+- register scalar-only host-native modules and functions
+
+Detailed notes live in:
+
+- [docs/C_API_READINESS.md](/Users/tensorcraft/Projects/TensorPy/docs/C_API_READINESS.md)
 
 ## Project Layout
 
-- [src/main.c](/Users/tensorcraft/Projects/TensorPy/src/main.c): CLI entry point and REPL
+- [src/main.c](/Users/tensorcraft/Projects/TensorPy/src/main.c): CLI and REPL entry point
 - [src/compiler.c](/Users/tensorcraft/Projects/TensorPy/src/compiler.c): parser and bytecode compiler
-- [src/vm.c](/Users/tensorcraft/Projects/TensorPy/src/vm.c): virtual machine and runtime behavior
-- [src/platform.c](/Users/tensorcraft/Projects/TensorPy/src/platform.c): portability layer for filesystem, time, random, and OS-facing helpers
+- [src/vm.c](/Users/tensorcraft/Projects/TensorPy/src/vm.c): VM and runtime behavior
+- [src/builtins.c](/Users/tensorcraft/Projects/TensorPy/src/builtins.c): builtins, tensor ops, autograd helpers, and native modules
+- [src/platform.c](/Users/tensorcraft/Projects/TensorPy/src/platform.c): portability layer
 - [modules](/Users/tensorcraft/Projects/TensorPy/modules): TensorPy standard-library-style modules
-- [modules/json.py](/Users/tensorcraft/Projects/TensorPy/modules/json.py): TensorPy JSON module
-- [modules/re.py](/Users/tensorcraft/Projects/TensorPy/modules/re.py): TensorPy regex module
-- [modules/math.py](/Users/tensorcraft/Projects/TensorPy/modules/math.py): TensorPy math module
-- [modules/time.py](/Users/tensorcraft/Projects/TensorPy/modules/time.py): TensorPy time module
-- [modules/random.py](/Users/tensorcraft/Projects/TensorPy/modules/random.py): TensorPy random module
-- [modules/os.py](/Users/tensorcraft/Projects/TensorPy/modules/os.py): TensorPy os module
-- [tests](/Users/tensorcraft/Projects/TensorPy/tests): ordered regression and feature tests
+- [tests](/Users/tensorcraft/Projects/TensorPy/tests): regression coverage
+- [benchmarks](/Users/tensorcraft/Projects/TensorPy/benchmarks): benchmark harnesses and runtime comparisons
 
 ## Limitations
 
-TensorPy is not yet a full Python implementation. Notable gaps still include:
+TensorPy is already useful for runtime experimentation, systems prototyping, embedding work, and compact ML execution paths. It is not yet:
 
-- incomplete builtin and standard library coverage
-- partial regex compatibility
+- a drop-in replacement for CPython
+- a full PyTorch replacement
+- a peak-throughput CUDA framework
 
-## C API Status
+Known gaps still include:
 
-TensorPy now has a minimal public embedding header:
+- incomplete Python compatibility in advanced edge cases
+- partial standard library coverage
+- incomplete Metal kernel coverage for several training-critical ops
+- no public container/callable ABI in the embedding surface yet
+- more optimization headroom in `matmul`, reductions, and eval-heavy paths
 
-- [include/tensorpy/api.h](/Users/tensorcraft/Projects/TensorPy/include/tensorpy/api.h)
+## Near-Term Direction
 
-That header is intentionally small and now exposes a frozen scalar-only Phase 1
-embedding and host-extension surface.
+Near-term priorities are:
 
-The current readiness call is:
-
-- third-party C extensions can target the scalar-only ABI in `api.h`
-- public values and host-native callbacks are limited to `nil`, `bool`,
-  `number`, `string`, and typed errors
-- containers, objects, and callables are still intentionally out of scope for
-  the public ABI until ownership rules are expanded and frozen
-
-More detail is documented in:
-
-- [docs/C_API_READINESS.md](/Users/tensorcraft/Projects/TensorPy/docs/C_API_READINESS.md)
-- [docs/SYNTAX.md](/Users/tensorcraft/Projects/TensorPy/docs/SYNTAX.md)
-- [docs/BUILTINS_AND_STDLIB.md](/Users/tensorcraft/Projects/TensorPy/docs/BUILTINS_AND_STDLIB.md)
-- missing GC work for later phases
-- incomplete Python compatibility for many edge cases and advanced syntax forms
-
-## TODO
-
-- expand data-structure method coverage, especially remaining `set`, `tuple`, `str`, and `bytes` behavior gaps
-- broaden general builtins beyond the current reflection and iterable helpers
-- extend module loading with richer search rules and better error reporting
-- continue improving package semantics and nested module behavior
-- strengthen exception compatibility, including richer exception objects and more Python-like error messages
-- improve REPL behavior for multi-line input, block handling, and interactive error display
-- expand `json` compatibility and validation behavior
-- extend `re` support with groups, alternation, counted repetition, and flags
-- add more large end-to-end language stress tests
-- revisit garbage collection in a later phase
+- continue improving end-to-end AI pipeline performance, not just isolated kernels
+- push more data ingress and preprocessing into the runtime where that improves latency
+- improve CPU `matmul` and additional kernel performance
+- reduce Metal synchronization overhead
+- expand benchmark coverage for embedded and always-on host-runtime scenarios
+- keep hardening TensorPy as an embeddable AI runtime rather than a language demo
 
 ## Status
 
-TensorPy is already useful for language and runtime experimentation, feature prototyping, and growing a test-backed Python-like interpreter. It is not yet a drop-in replacement for CPython or MicroPython.
+TensorPy is an active systems project focused on building a compact AI-native runtime from the interpreter upward.
+
+If you are interested in interpreter design, ML runtime internals, compact host embedding, or end-to-end control over AI execution, this repository is aimed at that space.

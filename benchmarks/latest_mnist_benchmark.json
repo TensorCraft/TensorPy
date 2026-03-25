@@ -1,0 +1,44 @@
+{
+  "environment": {
+    "date": "2026-03-24",
+    "host": "macOS",
+    "baseline": "PyTorch single-threaded",
+    "runs_per_scenario": 3
+  },
+  "startup": {
+    "startup_empty": {
+      "tensorpy": 0.05113281933333334,
+      "pytorch": 0.032675306000000015
+    },
+    "startup_ai_import": {
+      "tensorpy": 0.04482109733333336,
+      "pytorch": 1.012599
+    }
+  },
+  "scenarios": {
+    "single_step": {
+      "tensorpy_overall": 0.041118666666666664,
+      "pytorch_overall": 0.7619595556666667,
+      "tensorpy_train": 0.0004583333333333333,
+      "pytorch_train": 0.026815958333333317
+    },
+    "tiny_run": {
+      "tensorpy_overall": 0.047788,
+      "pytorch_overall": 0.647912792,
+      "tensorpy_train": 0.003783666666666667,
+      "pytorch_train": 0.023974764000000093
+    },
+    "small_run": {
+      "tensorpy_overall": 0.06512233333333334,
+      "pytorch_overall": 0.6996790556666667,
+      "tensorpy_train": 0.014921666666666666,
+      "pytorch_train": 0.03239795866666665
+    },
+    "full_run": {
+      "tensorpy_overall": 0.14278333333333335,
+      "pytorch_overall": 0.7661716390000001,
+      "tensorpy_train": 0.08629166666666667,
+      "pytorch_train": 0.0920377776666667
+    }
+  }
+}

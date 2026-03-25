@@ -569,9 +569,13 @@ static void freeObject(Obj* object) {
             break;
         case OBJ_TENSOR: {
             ObjTensor* tensor = (ObjTensor*)object;
-            tpMetalBufferDestroy(tensor->metalBuffer);
+            if (tensor->ownsMetalBuffer) {
+                tpMetalBufferDestroy(tensor->metalBuffer);
+            }
             tpMemFree(tensor->shape);
-            tpMemFree(tensor->data);
+            if (tensor->ownsData) {
+                tpMemFree(tensor->data);
+            }
             break;
         }
         case OBJ_CLASS:
@@ -834,6 +838,57 @@ ObjTensor* newTensor(int rank,
     tensor->shape = shapeCopy;
     tensor->data = dataCopy;
     tensor->metalBuffer = metalBuffer;
+    tensor->ownsData = true;
+    tensor->ownsMetalBuffer = metalBuffer != NULL;
+    tensor->cpuDirty = false;
+    tensor->metalDirty = false;
+    tensor->requiresGrad = false;
+    tensor->grad = NULL;
+    tensor->parentA = NULL;
+    tensor->parentB = NULL;
+    tensor->gradOp = TP_AUTOGRAD_NONE;
+    tensor->gradAux = 0.0f;
+    return tensor;
+}
+
+ObjTensor* newTensorView(int rank,
+                         const int* shape,
+                         ObjDType* dtype,
+                         ObjDevice* device,
+                         float* data,
+                         TPMetalBuffer* metalBuffer) {
+    ObjTensor* tensor;
+    int size;
+    int* shapeCopy = NULL;
+
+    if (dtype == NULL || device == NULL) {
+        return NULL;
+    }
+
+    size = tensorElementCount(rank, shape);
+    if (size < 0) {
+        return NULL;
+    }
+
+    if (rank > 0) {
+        shapeCopy = (int*)tpMemAlloc(sizeof(int) * (size_t)rank);
+        if (shapeCopy == NULL) {
+            return NULL;
+        }
+        memcpy(shapeCopy, shape, sizeof(int) * (size_t)rank);
+    }
+
+    tensor = ALLOCATE_OBJ(ObjTensor, OBJ_TENSOR);
+    tensor->rank = rank;
+    tensor->size = size;
+    tensor->dtype = dtype;
+    tensor->device = device;
+    tensor->contiguous = true;
+    tensor->shape = shapeCopy;
+    tensor->data = data;
+    tensor->metalBuffer = metalBuffer;
+    tensor->ownsData = false;
+    tensor->ownsMetalBuffer = false;
     tensor->cpuDirty = false;
     tensor->metalDirty = false;
     tensor->requiresGrad = false;

@@ -6,11 +6,11 @@ METAL ?= 1
 ifeq ($(METAL),1)
 OBJC_SRC = src/metal.m
 CFLAGS += -DTP_ENABLE_METAL=1
-LDFLAGS = -framework Foundation -framework Metal
+LDFLAGS = -framework Foundation -framework Metal -framework Accelerate
 else
 SRC += src/metal_stub.c
 CFLAGS += -DTP_ENABLE_METAL=0
-LDFLAGS =
+LDFLAGS = -framework Accelerate
 OBJC_SRC =
 endif
 

@@ -1,0 +1,64 @@
+<svg width="1200" height="980" viewBox="0 0 1200 980" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="980" fill="#F5F0E7"/>
+  <rect x="40" y="40" width="1120" height="900" rx="28" fill="#FFFCF7" stroke="#DED4C6" stroke-width="2"/>
+
+  <text x="86" y="110" fill="#1F1B18" font-family="Georgia, 'Iowan Old Style', serif" font-size="34" font-weight="700">TensorPy vs PyTorch</text>
+  <text x="86" y="146" fill="#5F5851" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="20">MNIST CNN benchmark focused on end-to-end runtime cost</text>
+  <text x="86" y="176" fill="#7D756C" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">3-run average, CPU only, PyTorch pinned to one thread, lower is better</text>
+
+  <rect x="834" y="90" width="18" height="18" rx="5" fill="#B85C22"/>
+  <text x="864" y="104" fill="#3C3630" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="16">TensorPy</text>
+  <rect x="962" y="90" width="18" height="18" rx="5" fill="#95A0A3"/>
+  <text x="992" y="104" fill="#3C3630" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="16">PyTorch</text>
+
+  <rect x="86" y="214" width="1028" height="164" rx="22" fill="#F7F1E8"/>
+  <text x="116" y="256" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="20" font-weight="700">AI Import Startup</text>
+  <text x="116" y="286" fill="#70685F" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">Importing the AI runtime itself is where integration matters most.</text>
+  <text x="998" y="256" text-anchor="end" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="20" font-weight="700">22.6x faster</text>
+  <text x="998" y="284" text-anchor="end" fill="#70685F" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">on this startup path</text>
+  <rect x="116" y="316" width="54" height="18" rx="7" fill="#B85C22"/>
+  <text x="184" y="331" fill="#B85C22" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.0448s</text>
+  <rect x="116" y="344" width="842" height="18" rx="7" fill="#95A0A3"/>
+  <text x="972" y="359" fill="#5F5851" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">1.0126s</text>
+
+  <text x="86" y="438" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="22" font-weight="700">Overall latency by workload</text>
+  <text x="86" y="468" fill="#70685F" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">These numbers include load, init, train, and eval together.</text>
+
+  <rect x="86" y="500" width="490" height="180" rx="22" fill="#FCF8F2" stroke="#E5DACD" stroke-width="2"/>
+  <text x="116" y="544" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">Single step</text>
+  <text x="116" y="574" fill="#70685F" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">1 sample</text>
+  <text x="520" y="544" text-anchor="end" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">18.5x</text>
+  <rect x="116" y="608" width="46" height="52" rx="10" fill="#B85C22"/>
+  <rect x="202" y="564" width="46" height="96" rx="10" fill="#95A0A3"/>
+  <text x="116" y="668" fill="#B85C22" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.041s</text>
+  <text x="202" y="668" fill="#5F5851" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.762s</text>
+
+  <rect x="624" y="500" width="490" height="180" rx="22" fill="#FCF8F2" stroke="#E5DACD" stroke-width="2"/>
+  <text x="654" y="544" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">Tiny run</text>
+  <text x="654" y="574" fill="#70685F" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">8 samples</text>
+  <text x="1058" y="544" text-anchor="end" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">13.6x</text>
+  <rect x="654" y="604" width="46" height="56" rx="10" fill="#B85C22"/>
+  <rect x="740" y="564" width="46" height="96" rx="10" fill="#95A0A3"/>
+  <text x="654" y="668" fill="#B85C22" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.048s</text>
+  <text x="740" y="668" fill="#5F5851" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.648s</text>
+
+  <rect x="86" y="708" width="490" height="180" rx="22" fill="#FCF8F2" stroke="#E5DACD" stroke-width="2"/>
+  <text x="116" y="752" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">Small run</text>
+  <text x="116" y="782" fill="#70685F" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">32 samples</text>
+  <text x="520" y="752" text-anchor="end" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">10.7x</text>
+  <rect x="116" y="812" width="46" height="48" rx="10" fill="#B85C22"/>
+  <rect x="202" y="764" width="46" height="96" rx="10" fill="#95A0A3"/>
+  <text x="116" y="876" fill="#B85C22" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.065s</text>
+  <text x="202" y="876" fill="#5F5851" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.700s</text>
+
+  <rect x="624" y="708" width="490" height="180" rx="22" fill="#FCF8F2" stroke="#E5DACD" stroke-width="2"/>
+  <text x="654" y="752" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">Full run</text>
+  <text x="654" y="782" fill="#70685F" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15">200 train / 50 test</text>
+  <text x="1058" y="752" text-anchor="end" fill="#1F1B18" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="18" font-weight="700">5.4x</text>
+  <rect x="654" y="800" width="46" height="60" rx="10" fill="#B85C22"/>
+  <rect x="740" y="764" width="46" height="96" rx="10" fill="#95A0A3"/>
+  <text x="654" y="876" fill="#B85C22" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.143s</text>
+  <text x="740" y="876" fill="#5F5851" font-family="'Avenir Next', 'Segoe UI', sans-serif" font-size="15" font-weight="700">0.766s</text>
+
+  <rect x="86" y="900" width="1028" height="24" rx="12" fill="#F4EEE4"/>
+</svg>

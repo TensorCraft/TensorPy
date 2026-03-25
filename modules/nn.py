@@ -193,7 +193,7 @@ def _target_device_name(saved_device, map_location):
 
 def _validate_parameter_device(target_device, requires_grad):
     if requires_grad and target_device != None and target_device.name != "cpu":
-        raise RuntimeError("Trainable module parameters currently support only CPU devices.")
+        raise RuntimeError("Trainable module parameters currently support only CPU devices. Use to_inference(device) for inference-only device moves.")
 
 
 def _deserialize_tensor(state, current=None, map_location=None):
@@ -350,7 +350,7 @@ def _load_state(value, prefix, state, map_location, missing, loaded):
     return value
 
 
-def _move_state_value(value, device):
+def _move_state_value(value, device, for_inference=False):
     if value == None:
         return value
 
@@ -358,10 +358,13 @@ def _move_state_value(value, device):
         target_device = device
         if type(device) != "device":
             target_device = ml.device(str(device))
-        _validate_parameter_device(target_device, value.requires_grad)
+        if not for_inference:
+            _validate_parameter_device(target_device, value.requires_grad)
         moved = value.to(device)
-        if value.requires_grad:
+        if value.requires_grad and not for_inference:
             return ml.Parameter(moved.tolist(), moved.dtype, moved.device)
+        if value.requires_grad and for_inference:
+            return ml.tensor(moved.tolist(), moved.dtype, moved.device)
         return moved
 
     if _is_module(value):
@@ -371,7 +374,7 @@ def _move_state_value(value, device):
             child = getattr(value, name)
             if not _is_state_container(child):
                 continue
-            updated = _move_state_value(child, device)
+            updated = _move_state_value(child, device, for_inference)
             if updated != child:
                 setattr(value, name, updated)
         return value
@@ -381,7 +384,7 @@ def _move_state_value(value, device):
         while i < len(value):
             child = value[i]
             if _is_state_container(child):
-                value[i] = _move_state_value(child, device)
+                value[i] = _move_state_value(child, device, for_inference)
             i = i + 1
         return value
 
@@ -392,7 +395,7 @@ def _move_state_value(value, device):
         for key in value:
             child = value[key]
             if _is_state_container(child):
-                value[key] = _move_state_value(child, device)
+                value[key] = _move_state_value(child, device, for_inference)
         return value
 
     return value
@@ -574,7 +577,11 @@ class Module:
         return self.load_state_dict(payload.get("state"), map_location, strict)
 
     def to(self, device):
-        _move_state_value(self, device)
+        _move_state_value(self, device, False)
+        return self
+
+    def to_inference(self, device):
+        _move_state_value(self, device, True)
         return self
 
     def parameters(self):
@@ -605,7 +612,7 @@ class Linear(Module):
     def __init__(self, in_features, out_features, bias=True):
         self.in_features = in_features
         self.out_features = out_features
-        limit = 1.0 / math.sqrt(in_features)
+        limit = 0.25 / math.sqrt(in_features)
         self.weight = ml.Parameter(_rand_uniform([in_features, out_features], -limit, limit))
         if bias:
             self.bias = ml.Parameter(_rand_uniform([out_features], -limit, limit))
@@ -613,6 +620,8 @@ class Linear(Module):
             self.bias = None
 
     def forward(self, x):
+        if self.bias != None and not x.requires_grad and not self.weight.requires_grad and not self.bias.requires_grad:
+            return ml.matmul(x, self.weight, self.bias)
         out = ml.matmul(x, self.weight)
         if self.bias != None:
             out = ml.add(out, self.bias)
@@ -667,10 +676,14 @@ class Conv2d(Module):
         else:
             self.bias = None
 
-    def forward(self, x):
+    def forward(self, x, fuse_relu=False):
+        if self.bias != None and not x.requires_grad and not self.weight.requires_grad and not self.bias.requires_grad:
+            return ml.conv2d(x, self.weight, self.bias, fuse_relu)
         out = ml.conv2d(x, self.weight)
         if self.bias != None:
             out = ml.add(out, self.bias)
+        if fuse_relu:
+            out = ml.relu(out)
         return out
 
 
@@ -708,8 +721,15 @@ class Sequential(Module):
 
     def forward(self, x):
         out = x
-        for layer in self.layers:
+        i = 0
+        while i < len(self.layers):
+            layer = self.layers[i]
+            if i + 1 < len(self.layers) and isinstance(layer, Conv2d) and isinstance(self.layers[i + 1], ReLU):
+                out = layer.forward(out, True)
+                i = i + 2
+                continue
             out = layer.forward(out)
+            i = i + 1
         return out
 
 

@@ -1665,12 +1665,14 @@ static bool invokeBuiltinMethod(Value receiver, ObjString* name, int argCount) {
                 raiseException(createExceptionValue("ValueError", "reshape() size mismatch"));
                 return false;
             }
-            result = newTensor(rank, shape, tensor->dtype, tensor->device, tensor->data);
+            result = newTensorView(rank, shape, tensor->dtype, tensor->device, tensor->data, tensor->metalBuffer);
             free(shape);
             if (result == NULL) {
                 runtimeError("Out of memory while reshaping tensor");
                 return false;
             }
+            result->cpuDirty = tensor->cpuDirty;
+            result->metalDirty = tensor->metalDirty;
             pop();
             pop();
             push(OBJ_VAL(result));

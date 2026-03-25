@@ -116,6 +116,32 @@ bool tpMetalMulScalarF32(TPMetalBackend* backend,
     return false;
 }
 
+bool tpMetalReluF32(TPMetalBackend* backend,
+                    TPMetalBuffer* input,
+                    TPMetalBuffer* out,
+                    int count) {
+    (void)backend;
+    (void)input;
+    (void)out;
+    (void)count;
+    return false;
+}
+
+bool tpMetalAddBias2DF32(TPMetalBackend* backend,
+                         TPMetalBuffer* input,
+                         TPMetalBuffer* bias,
+                         TPMetalBuffer* out,
+                         int rows,
+                         int cols) {
+    (void)backend;
+    (void)input;
+    (void)bias;
+    (void)out;
+    (void)rows;
+    (void)cols;
+    return false;
+}
+
 bool tpMetalMatmulF32(TPMetalBackend* backend,
                       TPMetalBuffer* a,
                       TPMetalBuffer* b,
@@ -130,5 +156,38 @@ bool tpMetalMatmulF32(TPMetalBackend* backend,
     (void)m;
     (void)n;
     (void)p;
+    return false;
+}
+
+bool tpMetalConv2dF32(TPMetalBackend* backend,
+                      TPMetalBuffer* input,
+                      TPMetalBuffer* weight,
+                      TPMetalBuffer* bias,
+                      TPMetalBuffer* out,
+                      int batch,
+                      int inChannels,
+                      int inHeight,
+                      int inWidth,
+                      int outChannels,
+                      int outHeight,
+                      int outWidth,
+                      int kernelHeight,
+                      int kernelWidth,
+                      int applyRelu) {
+    (void)backend;
+    (void)input;
+    (void)weight;
+    (void)bias;
+    (void)out;
+    (void)batch;
+    (void)inChannels;
+    (void)inHeight;
+    (void)inWidth;
+    (void)outChannels;
+    (void)outHeight;
+    (void)outWidth;
+    (void)kernelHeight;
+    (void)kernelWidth;
+    (void)applyRelu;
     return false;
 }
