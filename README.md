@@ -6,6 +6,10 @@ It is not a thin scripting layer over an external ML stack. The runtime owns the
 
 The project goal is not full CPython compatibility. The goal is a compact, hackable, systems-oriented runtime where AI workloads are first-class runtime behavior instead of an add-on library.
 
+Current full-MNIST benchmark snapshot:
+
+![TensorPy vs PyTorch full MNIST inference benchmark](docs/assets/full_mnist_inference_comparison.png)
+
 ## Why TensorPy Exists
 
 Most modern AI applications are assembled from multiple layers:
@@ -176,8 +180,6 @@ Current results:
 | CPU end-to-end overall | 0.3465s | 1.9726s | TensorPy wins by 5.7x |
 | Metal pure forward | 0.0575s | 0.0862s | TensorPy wins by 1.5x |
 | Metal end-to-end overall | 0.3342s | 1.9206s | TensorPy wins by 5.7x |
-
-![TensorPy vs PyTorch full MNIST inference benchmark](docs/assets/full_mnist_inference_comparison.png)
 
 Interpretation:
 
